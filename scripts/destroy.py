@@ -141,12 +141,14 @@ def main():
             fn(config)
         except Exception as e:
             print(f"  Warning: {e}")
-            errors.append(label)
+            errors.append((label, str(e)))
 
     print()
     if errors:
-        print(f"Completed with warnings in: {', '.join(errors)}")
-        print("Some resources may need manual cleanup.")
+        print("Completed with errors — the following may need manual cleanup:")
+        for label, detail in errors:
+            print(f"  • {label}: {detail}")
+        print(f"\nHint: check the Hetzner console, Cloudflare dashboard, and GitHub org settings.")
         sys.exit(1)
     else:
         print("All resources destroyed.")

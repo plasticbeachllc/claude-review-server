@@ -74,6 +74,12 @@ def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review")
                 if key.public_key.strip() == pubkey_content.strip():
                     print(f"  Reusing SSH key '{key.name}' on Hetzner")
                     return key
+            # Name collision with a different key
+            raise ProvisionError(
+                f"SSH key named '{name}' already exists on Hetzner but doesn't match "
+                f"your local public key. Delete it in the Hetzner console or use a "
+                f"different SERVER_NAME."
+            ) from e
         raise ProvisionError(f"Failed to create/find SSH key: {e}") from e
 
 
@@ -253,12 +259,13 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
     connector_token = data["result"]
 
     # 5. Install and start cloudflared on the server.
-    # Write token to a temp file, install from it, then delete — avoids
-    # exposing the token in process args via $(cat) shell expansion.
+    # Read token into a shell variable via stdin so it never appears in
+    # process args (/proc/*/cmdline).  The variable is only visible to
+    # the shell process itself.
     print("  Installing cloudflared tunnel on server...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{server_ip}",
-         "cat > /tmp/cf_token && cloudflared service install \"$(cat /tmp/cf_token)\"; rm -f /tmp/cf_token"],
+         "TUNNEL_TOKEN=$(cat) && cloudflared service install \"$TUNNEL_TOKEN\""],
         input=connector_token, capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
@@ -275,7 +282,8 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
 # ---------------------------------------------------------------------------
 def read_webhook_secret(ip: str) -> str:
     """Read the auto-generated GITHUB_WEBHOOK_SECRET from the server."""
-    raw = ssh(ip, "grep ^GITHUB_WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2-")
+    raw = ssh(ip, "grep ^GITHUB_WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2-",
+              label="read GITHUB_WEBHOOK_SECRET")
     if not raw:
         raise ProvisionError("Could not read GITHUB_WEBHOOK_SECRET from server")
     return raw
@@ -335,7 +343,11 @@ def _auto_cleanup(created: dict, config: dict):
     if not created:
         return
     print("\nCleaning up partially created resources...", file=sys.stderr)
-    from destroy import delete_dns_record, delete_server, delete_tunnel, delete_webhook
+    try:
+        from destroy import delete_dns_record, delete_server, delete_tunnel, delete_webhook
+    except ImportError as e:
+        print(f"  Warning: could not import destroy module for cleanup: {e}", file=sys.stderr)
+        return
 
     # Reverse order: webhook -> DNS -> tunnel -> server
     cleanup_steps = []

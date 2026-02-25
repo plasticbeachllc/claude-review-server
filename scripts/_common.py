@@ -154,7 +154,10 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
         except (ProvisionError, subprocess.TimeoutExpired, json.JSONDecodeError):
             pass  # transient SSH failures or parse errors — keep polling
         print(".", end="", flush=True)
-        time.sleep(10)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(10, remaining))
     raise ProvisionError(f"cloud-init did not finish within {timeout}s")
 
 
