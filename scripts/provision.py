@@ -46,8 +46,8 @@ from build import BuildError, build  # noqa: E402
 # ---------------------------------------------------------------------------
 # SSH key management
 # ---------------------------------------------------------------------------
-def find_local_pubkey() -> tuple[str, str]:
-    """Find the user's SSH public key. Returns (name, public_key_content)."""
+def find_local_pubkey() -> str:
+    """Find the user's SSH public key. Returns the public key content."""
     candidates = [
         Path.home() / ".ssh" / "id_ed25519.pub",
         Path.home() / ".ssh" / "id_ecdsa.pub",
@@ -55,8 +55,7 @@ def find_local_pubkey() -> tuple[str, str]:
     ]
     for path in candidates:
         if path.exists():
-            content = path.read_text().strip()
-            return (path.stem, content)
+            return path.read_text().strip()
     raise ProvisionError(
         "No SSH public key found. Expected ~/.ssh/id_ed25519.pub, "
         "~/.ssh/id_ecdsa.pub, or ~/.ssh/id_rsa.pub"
@@ -139,14 +138,25 @@ def inject_auth(ip: str, config: dict):
             f"stderr: {result.stderr.strip()}"
         )
 
-    # Claude Code auth — upsert token in the service env file
+    # Claude Code auth — upsert token in the service env file.
+    # Pipe via stdin (like GH_TOKEN above) to avoid leaking into process args.
     print("  Injecting Claude Code auth token...")
-    token_value = shlex.quote(config["CLAUDE_CODE_AUTH_TOKEN"])
-    ssh(ip,
-        f"grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env "
-        f"&& sed -i 's|^CLAUDE_CODE_AUTH_TOKEN=.*|CLAUDE_CODE_AUTH_TOKEN={token_value}|' /opt/pr-review/.env "
-        f"|| printf '%s\\n' 'CLAUDE_CODE_AUTH_TOKEN='{token_value} >> /opt/pr-review/.env",
-        label="upsert CLAUDE_CODE_AUTH_TOKEN in /opt/pr-review/.env")
+    upsert_cmd = (
+        "read -r TOKEN && "
+        "grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env "
+        "&& sed -i \"s|^CLAUDE_CODE_AUTH_TOKEN=.*|CLAUDE_CODE_AUTH_TOKEN=${TOKEN}|\" /opt/pr-review/.env "
+        "|| echo \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"
+    )
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"root@{ip}", upsert_cmd],
+        input=config["CLAUDE_CODE_AUTH_TOKEN"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise ProvisionError(
+            f"Claude Code auth injection failed (rc={result.returncode})\n"
+            f"stderr: {result.stderr.strip()}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +273,7 @@ def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # Check for existing webhook with the same URL
+    # Check for existing webhook (per_page=100 covers most orgs; no pagination)
     resp = requests.get(
         f"{GH_API}/orgs/{org}/hooks",
         headers=headers, params={"per_page": 100}, timeout=30,
@@ -316,7 +326,7 @@ def main():
 
         # 3. SSH key
         print("[3/8] Setting up SSH key...")
-        _, pubkey = find_local_pubkey()
+        pubkey = find_local_pubkey()
         client = Client(token=config["HCLOUD_TOKEN"])
         ssh_key = ensure_ssh_key(client, pubkey)
 

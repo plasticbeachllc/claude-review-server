@@ -1,5 +1,6 @@
 """Shared utilities for provisioning scripts."""
 
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -127,8 +128,6 @@ def wait_for_ssh(ip: str, timeout: int = 300):
 
 def wait_for_cloud_init(ip: str, timeout: int = 600):
     """Wait for cloud-init to finish on the server."""
-    import json
-
     print("  Waiting for cloud-init to finish...", end="", flush=True)
     deadline = time.time() + timeout
     while time.time() < deadline:

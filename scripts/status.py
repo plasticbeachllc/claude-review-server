@@ -43,6 +43,13 @@ def main():
     print(f"Location: {server.datacenter.name}")
     print(f"Created:  {server.created.isoformat()}")
 
+    # Connection info (always shown regardless of SSH availability)
+    hostname = config.get("TUNNEL_HOSTNAME", "")
+    if hostname:
+        print(f"Webhook:  https://{hostname}/webhook")
+    print(f"SSH:      ssh root@{ip}")
+    print(f"Logs:     ssh root@{ip} journalctl -u pr-review -f")
+
     if server.status != "running":
         return
 
@@ -60,12 +67,6 @@ def main():
         print(f"Health:   {health}")
     except Exception:
         print("Health:   (check failed)")
-
-    hostname = config.get("TUNNEL_HOSTNAME", "")
-    if hostname:
-        print(f"Webhook:  https://{hostname}/webhook")
-    print(f"SSH:      ssh root@{ip}")
-    print(f"Logs:     ssh root@{ip} journalctl -u pr-review -f")
 
 
 if __name__ == "__main__":

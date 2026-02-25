@@ -31,7 +31,7 @@ def delete_webhook(config: dict):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # List hooks (per_page=100 to reduce pagination risk)
+    # List hooks (per_page=100 covers most orgs; does not follow pagination)
     resp = requests.get(
         f"{GH_API}/orgs/{org}/hooks",
         headers=headers, params={"per_page": 100}, timeout=30,

@@ -124,8 +124,7 @@ class TestFindLocalPubkey:
         (ssh_dir / "id_ed25519.pub").write_text("ssh-ed25519 AAAA... user@host")
 
         with patch("provision.Path.home", return_value=tmp_path):
-            name, content = find_local_pubkey()
-        assert name == "id_ed25519"
+            content = find_local_pubkey()
         assert content.startswith("ssh-ed25519")
 
     def test_finds_ecdsa(self, tmp_path):
@@ -136,8 +135,8 @@ class TestFindLocalPubkey:
         (ssh_dir / "id_ecdsa.pub").write_text("ecdsa-sha2-nistp256 AAAA... user@host")
 
         with patch("provision.Path.home", return_value=tmp_path):
-            name, content = find_local_pubkey()
-        assert name == "id_ecdsa"
+            content = find_local_pubkey()
+        assert content.startswith("ecdsa-sha2")
 
     def test_falls_back_to_rsa(self, tmp_path):
         from provision import find_local_pubkey
@@ -147,8 +146,8 @@ class TestFindLocalPubkey:
         (ssh_dir / "id_rsa.pub").write_text("ssh-rsa AAAA... user@host")
 
         with patch("provision.Path.home", return_value=tmp_path):
-            name, content = find_local_pubkey()
-        assert name == "id_rsa"
+            content = find_local_pubkey()
+        assert content.startswith("ssh-rsa")
 
     def test_raises_when_no_key(self, tmp_path):
         from _common import ProvisionError
