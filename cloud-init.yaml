@@ -2,6 +2,9 @@
 # ─────────────────────────────────────────────────────────────────
 # PR Review Agent — Hetzner cloud-init
 #
+# GENERATED FILE — do not edit directly.
+# Edit the source files and run: just build
+#
 # POST-PROVISION STEPS (do these manually after first boot):
 #   1. Place Cloudflare Origin CA cert + key:
 #        /etc/caddy/certs/origin.pem
@@ -78,10 +81,12 @@ write_files:
       log = logging.getLogger("pr-review")
 
       # ── Configuration ────────────────────────────────────────
-      WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
+      WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
       WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
       MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
       REVIEW_MARKER = "<!-- claude-review -->"
+      SCRIPT_DIR = Path(__file__).resolve().parent
+      PROMPT_TEMPLATE = (SCRIPT_DIR / "prompt.md").read_text()
 
       # Files to drop first when truncating large diffs
       LOW_PRIORITY_PATTERNS = [
@@ -108,6 +113,7 @@ write_files:
 
 
       def is_low_priority(filename: str) -> bool:
+          """Check if a file matches low-priority patterns (lockfiles, generated, vendor, etc.)."""
           return any(re.search(p, filename) for p in LOW_PRIORITY_PATTERNS)
 
 
@@ -247,23 +253,14 @@ write_files:
                   log.warning(f"Empty diff for {repo}#{pr_number}")
                   return
 
-              prompt = f"""You are reviewing PR #{pr_number} in {repo}.
-      Title: {pr_title}
-      Description: {pr_body or "(none)"}
-
-      Review this diff. Be concise and actionable. Focus on:
-      1. Bugs, logic errors, edge cases
-      2. Security concerns
-      3. Missing error handling
-      4. Concrete suggestions for improvement
-
-      If the PR looks good, say so briefly. Don't nitpick formatting or style.
-      {truncation_note}
-
-      Diff:
-      ```
-      {diff}
-      ```"""
+              prompt = PROMPT_TEMPLATE.format(
+                  pr_number=pr_number,
+                  repo=repo,
+                  pr_title=pr_title,
+                  pr_body=pr_body or "(none)",
+                  truncation_note=truncation_note,
+                  diff=diff,
+              )
 
               result = subprocess.run(
                   ["claude", "-p", prompt, "--output-format", "text"],
@@ -370,12 +367,37 @@ write_files:
 
 
       if __name__ == "__main__":
+          if not WEBHOOK_SECRET:
+              log.error("GITHUB_WEBHOOK_SECRET environment variable is required")
+              sys.exit(1)
           WORKDIR.mkdir(parents=True, exist_ok=True)
           port = int(os.environ.get("PORT", "8080"))
           server = HTTPServer(("127.0.0.1", port), WebhookHandler)
           log.info(f"PR Review Agent listening on 127.0.0.1:{port} "
                    f"(workers={MAX_WORKERS})")
           server.serve_forever()
+
+  # ── Review prompt template ──────────────────────────────────
+  - path: /opt/pr-review/prompt.md
+    permissions: "0644"
+    content: |
+      You are reviewing PR #{pr_number} in {repo}.
+      Title: {pr_title}
+      Description: {pr_body}
+
+      Review this diff. Be concise and actionable. Focus on:
+      1. Bugs, logic errors, edge cases
+      2. Security concerns
+      3. Missing error handling
+      4. Concrete suggestions for improvement
+
+      If the PR looks good, say so briefly. Don't nitpick formatting or style.
+      {truncation_note}
+
+      Diff:
+      ```
+      {diff}
+      ```
 
   # ── Auth health check script ──────────────────────────────
   - path: /opt/pr-review/check-auth.sh
