@@ -7,9 +7,9 @@ import json
 import logging
 import os
 import re
-import shlex
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -39,13 +39,16 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
+_prompt_lock = threading.Lock()
 
 
 def get_prompt_template() -> str:
-    """Lazy-load the prompt template on first use."""
+    """Lazy-load the prompt template on first use (thread-safe)."""
     global _prompt_template
     if _prompt_template is None:
-        _prompt_template = (SCRIPT_DIR / "prompt.md").read_text()
+        with _prompt_lock:
+            if _prompt_template is None:  # double-checked locking
+                _prompt_template = (SCRIPT_DIR / "prompt.md").read_text()
     return _prompt_template
 
 # Files to drop first when truncating large diffs
@@ -59,6 +62,9 @@ LOW_PRIORITY_PATTERNS = [
 ]
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# Regex for extracting the filename from "diff --git a/path b/path"
+DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -92,8 +98,8 @@ def smart_truncate_diff(diff: str, max_chars: int = 40_000) -> tuple[str, str]:
                 file_diffs.append((current_name, "".join(current)))
             current = [line]
             # Extract filename from "diff --git a/path b/path"
-            parts = shlex.split(line)
-            current_name = parts[-1][2:] if len(parts) >= 4 else "unknown"
+            m = DIFF_HEADER_RE.match(line.rstrip())
+            current_name = m.group(2) if m else "unknown"
         else:
             current.append(line)
     if current:

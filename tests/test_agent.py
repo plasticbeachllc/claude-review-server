@@ -177,3 +177,12 @@ class TestBuild:
         assert "agent.py" in output
         assert "check-auth.sh" in output
         assert "prompt.md" in output
+
+    def test_build_raises_on_missing_file(self, tmp_path):
+        from build import build, BuildError
+
+        # Write a template referencing a file that doesn't exist
+        template = tmp_path / "cloud-init.tmpl.yaml"
+        template.write_text("content: |\n  {{FILE:nonexistent.py}}\n")
+        with pytest.raises(BuildError, match="nonexistent.py"):
+            build(tmp_path)

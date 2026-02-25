@@ -20,6 +20,10 @@ deploy host:
     ssh {{host}} 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md /opt/pr-review/check-auth.sh && systemctl restart pr-review'
     @echo "✓ Deployed and restarted on {{host}}"
 
+# Check that cloud-init.yaml is up to date (for CI)
+check: build
+    python3 build.py --check
+
 # Run tests
 test:
     uv run pytest tests/ -v
