@@ -6,6 +6,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _gh_response(status_code=200, json_data=None, text="", headers=None):
+    """Create a mock GitHub API response with sensible defaults."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json = MagicMock(return_value=json_data if json_data is not None else [])
+    resp.text = text
+    resp.headers = headers or {}
+    return resp
+
+
 # ── Config loading ─────────────────────────────────────────
 
 
@@ -200,14 +210,8 @@ class TestCreateWebhook:
         from provision import create_webhook
 
         # No existing webhooks
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [],
-        )
-        mock_post.return_value = MagicMock(
-            status_code=201,
-            json=lambda: {"id": 42},
-        )
+        mock_get.return_value = _gh_response(200, [])
+        mock_post.return_value = _gh_response(201, {"id": 42})
 
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
         create_webhook(config, "secret123", "pr-review.example.com")
@@ -225,14 +229,8 @@ class TestCreateWebhook:
         from _common import ProvisionError
         from provision import create_webhook
 
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [],
-        )
-        mock_post.return_value = MagicMock(
-            status_code=422,
-            text="Validation failed",
-        )
+        mock_get.return_value = _gh_response(200, [])
+        mock_post.return_value = _gh_response(422, text="Validation failed")
 
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
         with pytest.raises(ProvisionError, match="422"):
@@ -243,11 +241,8 @@ class TestCreateWebhook:
     def test_skips_when_webhook_exists(self, mock_post, mock_get):
         from provision import create_webhook
 
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [
-                {"id": 99, "config": {"url": "https://pr-review.example.com/webhook"}},
-            ],
+        mock_get.return_value = _gh_response(
+            200, [{"id": 99, "config": {"url": "https://pr-review.example.com/webhook"}}],
         )
 
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
@@ -266,13 +261,10 @@ class TestDestroy:
     def test_delete_webhook_finds_and_deletes(self, mock_delete, mock_get):
         from destroy import delete_webhook
 
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [
-                {"id": 1, "config": {"url": "https://other.example.com/webhook"}},
-                {"id": 2, "config": {"url": "https://pr-review.example.com/webhook"}},
-            ],
-        )
+        mock_get.return_value = _gh_response(200, [
+            {"id": 1, "config": {"url": "https://other.example.com/webhook"}},
+            {"id": 2, "config": {"url": "https://pr-review.example.com/webhook"}},
+        ])
         mock_delete.return_value = MagicMock(status_code=204)
 
         config = {
@@ -303,10 +295,7 @@ class TestDestroy:
     def test_delete_webhook_uses_pagination(self, mock_get):
         from destroy import delete_webhook
 
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [],
-        )
+        mock_get.return_value = _gh_response(200, [])
 
         config = {
             "GITHUB_ORG": "myorg",
@@ -324,10 +313,7 @@ class TestDestroy:
         from _common import ProvisionError
         from destroy import delete_webhook
 
-        mock_get.return_value = MagicMock(
-            status_code=403,
-            text="Forbidden",
-        )
+        mock_get.return_value = _gh_response(403, text="Forbidden")
 
         config = {
             "GITHUB_ORG": "myorg",
@@ -336,3 +322,197 @@ class TestDestroy:
         }
         with pytest.raises(ProvisionError, match="403"):
             delete_webhook(config)
+
+
+# ── Pagination overflow detection ─────────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestCheckPagination:
+    def test_no_link_header_passes(self):
+        from _common import check_pagination
+
+        resp = _gh_response(200, [])
+        check_pagination(resp, "webhooks")  # should not raise
+
+    def test_link_header_with_next_raises(self):
+        from _common import ProvisionError, check_pagination
+
+        resp = _gh_response(200, [], headers={
+            "Link": '<https://api.github.com/orgs/myorg/hooks?page=2>; rel="next"',
+        })
+        with pytest.raises(ProvisionError, match="paginated webhooks"):
+            check_pagination(resp, "webhooks")
+
+    @patch("provision.requests.get")
+    @patch("provision.requests.post")
+    def test_create_webhook_raises_on_pagination(self, mock_post, mock_get):
+        from _common import ProvisionError
+        from provision import create_webhook
+
+        mock_get.return_value = _gh_response(200, [], headers={
+            "Link": '<https://api.github.com/orgs/x/hooks?page=2>; rel="next"',
+        })
+        config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
+        with pytest.raises(ProvisionError, match="paginated"):
+            create_webhook(config, "secret", "host.example.com")
+        mock_post.assert_not_called()
+
+
+# ── Auto-cleanup on provision failure ─────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestAutoCleanup:
+    def test_auto_cleanup_calls_destroy_functions(self):
+        from provision import _auto_cleanup
+
+        config = {"SERVER_NAME": "test", "GITHUB_ORG": "org", "TUNNEL_HOSTNAME": "h"}
+        created = {"server": "test", "tunnel": "h", "webhook": "h"}
+
+        with patch("destroy.delete_webhook") as dw, \
+             patch("destroy.delete_dns_record") as dd, \
+             patch("destroy.delete_tunnel") as dt, \
+             patch("destroy.delete_server") as ds:
+            _auto_cleanup(created, config)
+
+        dw.assert_called_once_with(config)
+        dd.assert_called_once_with(config)
+        dt.assert_called_once_with(config)
+        ds.assert_called_once_with(config)
+
+    def test_auto_cleanup_skips_when_empty(self):
+        from provision import _auto_cleanup
+
+        # Should not raise or call anything
+        _auto_cleanup({}, {})
+
+    def test_auto_cleanup_continues_on_failure(self):
+        from provision import _auto_cleanup
+
+        config = {"SERVER_NAME": "test"}
+        created = {"server": "test", "tunnel": "h"}
+
+        with patch("destroy.delete_dns_record", side_effect=Exception("boom")), \
+             patch("destroy.delete_tunnel") as dt, \
+             patch("destroy.delete_server") as ds:
+            # Should not raise despite delete_dns_record failing
+            _auto_cleanup(created, config)
+
+        dt.assert_called_once()
+        ds.assert_called_once()
+
+    def test_main_handles_config_failure_without_unbound_error(self):
+        """Regression test: load_config failure must not cause UnboundLocalError."""
+        from _common import ProvisionError
+        from provision import main
+
+        with patch("provision.load_config", side_effect=ProvisionError("bad .env")):
+            with pytest.raises(SystemExit) as exc:
+                main()
+            assert exc.value.code == 1
+
+
+# ── setup_tunnel ──────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestSetupTunnel:
+    def _config(self):
+        return {
+            "CF_API_TOKEN": "cf-tok",
+            "CF_ACCOUNT_ID": "acct-1",
+            "CF_ZONE_ID": "zone-1",
+            "TUNNEL_HOSTNAME": "review.example.com",
+            "SERVER_NAME": "pr-review",
+        }
+
+    @patch("provision.subprocess.run")
+    @patch("provision.cf_request")
+    def test_creates_new_tunnel_and_dns(self, mock_cf, mock_run):
+        from provision import setup_tunnel
+
+        # cf_request responses in order:
+        # 1. GET tunnels (empty — no existing)
+        # 2. POST create tunnel
+        # 3. PUT ingress config
+        # 4. GET DNS records (empty — no existing)
+        # 5. POST create DNS
+        # 6. GET connector token
+        mock_cf.side_effect = [
+            {"result": []},
+            {"result": {"id": "tun-123"}},
+            {"result": {}},
+            {"result": []},
+            {"result": {}},
+            {"result": "connector-token-value"},
+        ]
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        hostname = setup_tunnel(self._config(), "1.2.3.4")
+
+        assert hostname == "review.example.com"
+        # Verify tunnel creation was POSTed
+        assert mock_cf.call_args_list[1][0][0] == "POST"
+        # Verify DNS creation was POSTed
+        assert mock_cf.call_args_list[4][0][0] == "POST"
+
+    @patch("provision.subprocess.run")
+    @patch("provision.cf_request")
+    def test_reuses_existing_tunnel(self, mock_cf, mock_run):
+        from provision import setup_tunnel
+
+        mock_cf.side_effect = [
+            {"result": [{"id": "existing-tun"}]},  # GET tunnels — found existing
+            {"result": {}},                          # PUT ingress config
+            {"result": []},                          # GET DNS records
+            {"result": {}},                          # POST create DNS
+            {"result": "token-val"},                 # GET connector token
+        ]
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        hostname = setup_tunnel(self._config(), "1.2.3.4")
+
+        assert hostname == "review.example.com"
+        # Should NOT have POSTed a new tunnel (call 0 is GET, call 1 is PUT ingress)
+        assert mock_cf.call_args_list[0][0][0] == "GET"
+        assert mock_cf.call_args_list[1][0][0] == "PUT"
+
+    @patch("provision.subprocess.run")
+    @patch("provision.cf_request")
+    def test_updates_existing_dns_record(self, mock_cf, mock_run):
+        from provision import setup_tunnel
+
+        mock_cf.side_effect = [
+            {"result": [{"id": "tun-1"}]},                    # GET tunnels — existing
+            {"result": {}},                                     # PUT ingress
+            {"result": [{"id": "dns-rec-1"}]},                 # GET DNS — existing record
+            {"result": {}},                                     # PUT update DNS
+            {"result": "tok"},                                  # GET connector token
+        ]
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        setup_tunnel(self._config(), "1.2.3.4")
+
+        # DNS step should be PUT (update), not POST (create)
+        dns_call = mock_cf.call_args_list[3]
+        assert dns_call[0][0] == "PUT"
+        assert "dns-rec-1" in dns_call[0][1]
+
+    @patch("provision.subprocess.run")
+    @patch("provision.cf_request")
+    def test_raises_on_cloudflared_install_failure(self, mock_cf, mock_run):
+        from _common import ProvisionError
+        from provision import setup_tunnel
+
+        mock_cf.side_effect = [
+            {"result": [{"id": "tun-1"}]},
+            {"result": {}},
+            {"result": []},
+            {"result": {}},
+            {"result": "tok"},
+        ]
+        mock_run.return_value = MagicMock(returncode=1, stderr="install failed")
+
+        with pytest.raises(ProvisionError, match="cloudflared install failed"):
+            setup_tunnel(self._config(), "1.2.3.4")

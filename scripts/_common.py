@@ -159,6 +159,25 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
 
 
 # ---------------------------------------------------------------------------
+# GitHub API helpers
+# ---------------------------------------------------------------------------
+def check_pagination(resp, resource: str = "items"):
+    """Raise if a GitHub API response indicates truncated results.
+
+    We request per_page=100 without following pagination.  If the response
+    contains a ``Link`` header with ``rel="next"``, results were truncated
+    and the caller would silently miss entries.
+    """
+    link = resp.headers.get("Link", "")
+    if 'rel="next"' in link:
+        raise ProvisionError(
+            f"GitHub returned paginated {resource} (>100). "
+            f"This script does not follow pagination — please reduce the "
+            f"number of {resource} or implement pagination support."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cloudflare API helper
 # ---------------------------------------------------------------------------
 def cf_request(method: str, path: str, token: str, **kwargs) -> dict:

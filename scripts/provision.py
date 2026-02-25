@@ -34,6 +34,7 @@ from _common import (  # noqa: E402
     SSH_OPTS,
     ProvisionError,
     cf_request,
+    check_pagination,
     load_config,
     ssh,
     wait_for_cloud_init,
@@ -61,9 +62,8 @@ def find_local_pubkey() -> str:
     )
 
 
-def ensure_ssh_key(client: Client, pubkey_content: str) -> SSHKey:
+def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review") -> SSHKey:
     """Find or create the SSH key on Hetzner (matched by fingerprint)."""
-    name = "pr-review"
     try:
         key = client.ssh_keys.create(name=name, public_key=pubkey_content)
         print(f"  Created SSH key '{name}' on Hetzner")
@@ -138,20 +138,28 @@ def inject_auth(ip: str, config: dict):
         )
 
     # Claude Code auth — upsert token in the service env file.
-    # Pipe via stdin to avoid leaking into process args.  Uses a Python
-    # one-liner on the remote to avoid shell quoting / sed delimiter issues
-    # with arbitrary token values.
+    # SCP a small Python script to the server to avoid fragile shell quoting.
+    # Token is read from stdin to avoid leaking into process args.
     print("  Injecting Claude Code auth token...")
-    upsert_cmd = (
-        'python3 -c "'
-        "import sys; t=sys.stdin.read().strip(); p='/opt/pr-review/.env'; "
-        "ls=open(p).readlines(); k='CLAUDE_CODE_AUTH_TOKEN='; "
-        "ns=[k+t+'\\n' if l.startswith(k) else l for l in ls]; "
-        "ns.append(k+t+'\\n') if not any(l.startswith(k) for l in ls) else None; "
-        'open(p,\'w\').writelines(ns)"'
+    upsert_script = (
+        "import sys\n"
+        "token = sys.stdin.read().strip()\n"
+        "path = '/opt/pr-review/.env'\n"
+        "key = 'CLAUDE_CODE_AUTH_TOKEN='\n"
+        "lines = open(path).readlines()\n"
+        "new_lines = [key + token + '\\n' if l.startswith(key) else l for l in lines]\n"
+        "if not any(l.startswith(key) for l in lines):\n"
+        "    new_lines.append(key + token + '\\n')\n"
+        "open(path, 'w').writelines(new_lines)\n"
+    )
+    # Write script to server via stdin, then execute it with token on stdin
+    subprocess.run(
+        ["ssh", *SSH_OPTS, f"root@{ip}", "cat > /tmp/_upsert_env.py"],
+        input=upsert_script, capture_output=True, text=True, timeout=10,
+        check=True,
     )
     result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"root@{ip}", upsert_cmd],
+        ["ssh", *SSH_OPTS, f"root@{ip}", "python3 /tmp/_upsert_env.py; rm -f /tmp/_upsert_env.py"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
         capture_output=True, text=True, timeout=30,
     )
@@ -244,11 +252,13 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
     data = cf_request("GET", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/token", token)
     connector_token = data["result"]
 
-    # 5. Install and start cloudflared on the server (pipe token via stdin)
+    # 5. Install and start cloudflared on the server.
+    # Write token to a temp file, install from it, then delete — avoids
+    # exposing the token in process args via $(cat) shell expansion.
     print("  Installing cloudflared tunnel on server...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{server_ip}",
-         "cloudflared service install $(cat)"],
+         "cat > /tmp/cf_token && cloudflared service install \"$(cat /tmp/cf_token)\"; rm -f /tmp/cf_token"],
         input=connector_token, capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
@@ -284,12 +294,13 @@ def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # Check for existing webhook (per_page=100 covers most orgs; no pagination)
+    # Check for existing webhook (per_page=100 covers most orgs)
     resp = requests.get(
         f"{GH_API}/orgs/{org}/hooks",
         headers=headers, params={"per_page": 100}, timeout=30,
     )
     if resp.status_code == 200:
+        check_pagination(resp, "webhooks")
         for hook in resp.json():
             if hook.get("config", {}).get("url") == url:
                 print(f"  Webhook already exists (id={hook['id']}), skipping creation")
@@ -352,6 +363,7 @@ def _auto_cleanup(created: dict, config: dict):
 def main():
     root = Path(__file__).resolve().parent.parent
     created = {}  # Track created resources for error reporting
+    config = {}   # Initialized before try so _auto_cleanup always has a valid ref
 
     try:
         # 1. Config
@@ -366,7 +378,7 @@ def main():
         print("[3/8] Setting up SSH key...")
         pubkey = find_local_pubkey()
         client = Client(token=config["HCLOUD_TOKEN"])
-        ssh_key = ensure_ssh_key(client, pubkey)
+        ssh_key = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
 
         # 4. Create server
         print("[4/8] Creating Hetzner server...")
