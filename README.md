@@ -21,11 +21,16 @@ GitHub webhook → Cloudflare Tunnel (TLS) → cloudflared → Caddy (reverse pr
 ## Project structure
 
 ```
-agent.py                 # Webhook listener + review logic
-prompt.md                # Review prompt template (customize this!)
-cloud-init.tmpl.yaml     # Cloud-init template with {{FILE:...}} markers
-build.py                 # Assembles cloud-init.yaml from template + source files
-Caddyfile.origin-ca      # Caddy TLS config for custom domain setup
+src/
+  agent.py               # Webhook listener + review logic
+  prompt.md              # Review prompt template (customize this!)
+infra/
+  cloud-init.tmpl.yaml   # Cloud-init template with {{FILE:...}} markers
+  Caddyfile.origin-ca    # Caddy TLS config for custom domain setup
+scripts/
+  build.py               # Assembles cloud-init.yaml from template + source files
+tests/
+  test_agent.py          # Unit tests
 Justfile                 # Build, test, and deploy commands
 pyproject.toml           # Python project config (dev deps via uv)
 .env.example             # Copy to .env, fill in your values
@@ -60,7 +65,7 @@ cp .env.example .env
 
 ### 2. Customize the review prompt (optional)
 
-Edit `prompt.md` to change what Claude focuses on during reviews.
+Edit `src/prompt.md` to change what Claude focuses on during reviews.
 
 ### 3. Build cloud-init.yaml
 
@@ -189,7 +194,7 @@ just clean                                    # Remove built cloud-init.yaml
 
 ## Updating a running server
 
-After editing `agent.py` or `prompt.md`:
+After editing `src/agent.py` or `src/prompt.md`:
 
 ```bash
 just deploy root@<server-ip>
@@ -201,7 +206,7 @@ This copies the files and restarts the service. No need to rebuild cloud-init.ya
 
 ### Review prompt
 
-Edit `prompt.md`. The template uses Python format strings: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{diff}`.
+Edit `src/prompt.md`. The template uses Python format strings: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{diff}`.
 
 ### Diff size limit
 
@@ -213,7 +218,7 @@ Set `MAX_WORKERS` in `.env` (default: 4).
 
 ### Low-priority file patterns
 
-Edit `LOW_PRIORITY_PATTERNS` in `agent.py` to control which files get dropped first when diffs are truncated. Defaults: lockfiles, generated code, snapshots, SVGs, vendored code.
+Edit `LOW_PRIORITY_PATTERNS` in `src/agent.py` to control which files get dropped first when diffs are truncated. Defaults: lockfiles, generated code, snapshots, SVGs, vendored code.
 
 ---
 
@@ -237,5 +242,5 @@ Edit `LOW_PRIORITY_PATTERNS` in `agent.py` to control which files get dropped fi
 |------|-----------|-----|
 | Renew Claude token | Yearly | `claude setup-token`, update `.env`, restart |
 | Renew Origin CA cert | 15 years | Regenerate in Cloudflare, replace cert files (custom domain only) |
-| Update Claude Code | As needed | Bump version in `cloud-init.tmpl.yaml`, `just build` |
+| Update Claude Code | As needed | Bump version in `infra/cloud-init.tmpl.yaml`, `just build` |
 | System packages | Monthly | `apt update && apt upgrade` |

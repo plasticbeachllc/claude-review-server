@@ -165,6 +165,7 @@ class TestSmartTruncateDiff:
 # ── build.py ─────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("scripts_on_path")
 class TestBuild:
     def test_build_produces_valid_output(self):
         from build import build
@@ -181,7 +182,9 @@ class TestBuild:
         from build import build, BuildError
 
         # Write a template referencing a file that doesn't exist
-        template = tmp_path / "cloud-init.tmpl.yaml"
+        infra = tmp_path / "infra"
+        infra.mkdir()
+        template = infra / "cloud-init.tmpl.yaml"
         template.write_text("content: |\n  {{FILE:nonexistent.py}}\n")
         with pytest.raises(BuildError, match="nonexistent.py"):
             build(tmp_path)
@@ -189,7 +192,9 @@ class TestBuild:
     def test_build_rejects_path_traversal(self, tmp_path):
         from build import build, BuildError
 
-        template = tmp_path / "cloud-init.tmpl.yaml"
+        infra = tmp_path / "infra"
+        infra.mkdir()
+        template = infra / "cloud-init.tmpl.yaml"
         template.write_text("content: |\n  {{FILE:../../etc/passwd}}\n")
         with pytest.raises(BuildError, match="path traversal"):
             build(tmp_path)
