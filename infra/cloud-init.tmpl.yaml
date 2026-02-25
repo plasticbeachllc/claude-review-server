@@ -40,13 +40,13 @@ write_files:
   - path: /opt/pr-review/agent.py
     permissions: "0755"
     content: |
-      {{FILE:agent.py}}
+      {{FILE:src/agent.py}}
 
   # ── Review prompt template ──────────────────────────────────
   - path: /opt/pr-review/prompt.md
     permissions: "0644"
     content: |
-      {{FILE:prompt.md}}
+      {{FILE:src/prompt.md}}
 
   # ── Systemd service ───────────────────────────────────────
   - path: /etc/systemd/system/pr-review.service

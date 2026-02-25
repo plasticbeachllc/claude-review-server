@@ -5,14 +5,14 @@ Reads cloud-init.tmpl.yaml, finds {{FILE:path}} markers, and replaces
 each with the file contents indented to match the YAML block scalar level.
 
 Usage:
-    python3 build.py    # Build cloud-init.yaml
+    python3 scripts/build.py    # Build cloud-init.yaml
 """
 
 import re
 import sys
 from pathlib import Path
 
-TEMPLATE = "cloud-init.tmpl.yaml"
+TEMPLATE = "infra/cloud-init.tmpl.yaml"
 OUTPUT = "cloud-init.yaml"
 MARKER_RE = re.compile(r"^(\s*)(\{\{FILE:(.+?)\}\})\s*$")
 
@@ -58,7 +58,7 @@ def build(root: Path) -> str:
 
 
 def main():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
 
     try:
         result = build(root)
