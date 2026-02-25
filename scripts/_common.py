@@ -82,6 +82,13 @@ def load_config(root: Path) -> dict:
         # Strip surrounding quotes (single or double) — common .env convention
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
             value = value[1:-1]
+        else:
+            # Strip inline comments for unquoted values (e.g. KEY=value # comment).
+            # Only " #" is treated as a comment start — bare "#" inside values
+            # is preserved (handles e.g. URLs with fragments).
+            comment_idx = value.find(" #")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
         config[key.strip()] = value
 
     # Apply defaults
@@ -171,20 +178,32 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
 # ---------------------------------------------------------------------------
 # GitHub API helpers
 # ---------------------------------------------------------------------------
-def check_pagination(resp, resource: str = "items"):
-    """Raise if a GitHub API response indicates truncated results.
+def gh_paginate(url: str, headers: dict, params: dict | None = None,
+                timeout: int = 30) -> list:
+    """Fetch all pages of a GitHub API list endpoint.
 
-    We request per_page=100 without following pagination.  If the response
-    contains a ``Link`` header with ``rel="next"``, results were truncated
-    and the caller would silently miss entries.
+    Follows ``Link: rel="next"`` headers automatically so callers never
+    silently miss results.  ``params`` are only sent on the first request;
+    subsequent pages use the URL from the Link header which already contains
+    query parameters.
     """
-    link = resp.headers.get("Link", "")
-    if 'rel="next"' in link:
-        raise ProvisionError(
-            f"GitHub returned paginated {resource} (>100). "
-            f"This script does not follow pagination — please reduce the "
-            f"number of {resource} or implement pagination support."
-        )
+    all_items: list = []
+    while url:
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code != 200:
+            raise ProvisionError(
+                f"GitHub API error ({resp.status_code}): {resp.text}"
+            )
+        all_items.extend(resp.json())
+        # Follow pagination — params are baked into the Link URL for page 2+
+        url = None
+        params = None
+        link = resp.headers.get("Link", "")
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<>")
+                break
+    return all_items
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ from _common import (  # noqa: E402
     SSH_OPTS,
     ProvisionError,
     cf_request,
-    check_pagination,
+    gh_paginate,
     load_config,
     ssh,
     wait_for_cloud_init,
@@ -195,12 +195,16 @@ def inject_auth(ip: str, config: dict):
 # ---------------------------------------------------------------------------
 # Cloudflare Tunnel
 # ---------------------------------------------------------------------------
-def setup_tunnel(config: dict, server_ip: str) -> str:
+def setup_tunnel(config: dict, server_ip: str, created: dict | None = None) -> str:
     """Create a Cloudflare Tunnel, configure DNS, and install on the server.
 
     If a tunnel with the same name already exists, reuses it instead of
-    creating a duplicate.
+    creating a duplicate.  ``created`` is updated progressively so that
+    ``_auto_cleanup`` can clean up resources even if this function fails
+    mid-way (e.g. after DNS creation but before cloudflared install).
     """
+    if created is None:
+        created = {}
     token = config["CF_API_TOKEN"]
     account = config["CF_ACCOUNT_ID"]
     zone = config["CF_ZONE_ID"]
@@ -225,6 +229,7 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
         )
         tunnel_id = data["result"]["id"]
         print(f"  Tunnel created: {tunnel_id}")
+    created["tunnel"] = tunnel_name
 
     # 2. Configure ingress
     print("  Configuring tunnel ingress...")
@@ -268,6 +273,7 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
                 "proxied": True,
             },
         )
+    created["dns"] = hostname
 
     # 4. Get connector token
     print("  Getting tunnel connector token...")
@@ -275,13 +281,15 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
     connector_token = data["result"]
 
     # 5. Install and start cloudflared on the server.
+    # Uninstall first so re-provisioning doesn't fail on "already installed".
     # Read token into a shell variable via stdin so it never appears in
     # process args (/proc/*/cmdline).  The variable is only visible to
     # the shell process itself.
     print("  Installing cloudflared tunnel on server...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{server_ip}",
-         "TUNNEL_TOKEN=$(cat) && cloudflared service install \"$TUNNEL_TOKEN\""],
+         "cloudflared service uninstall 2>/dev/null || true;"
+         " TUNNEL_TOKEN=$(cat) && cloudflared service install \"$TUNNEL_TOKEN\""],
         input=connector_token, capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
@@ -318,18 +326,12 @@ def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # Check for existing webhook (per_page=100 covers most orgs).
-    # Raise on non-200 to avoid silently creating duplicates on transient errors.
-    resp = requests.get(
+    # List all webhooks (follows pagination automatically).
+    hooks = gh_paginate(
         f"{GH_API}/orgs/{org}/hooks",
-        headers=headers, params={"per_page": 100}, timeout=30,
+        headers=headers, params={"per_page": 100},
     )
-    if resp.status_code != 200:
-        raise ProvisionError(
-            f"Could not list webhooks ({resp.status_code}): {resp.text}"
-        )
-    check_pagination(resp, "webhooks")
-    for hook in resp.json():
+    for hook in hooks:
         if hook.get("config", {}).get("url") == url:
             print(f"  Webhook already exists (id={hook['id']}), skipping creation")
             return
@@ -374,11 +376,10 @@ def _auto_cleanup(created: dict, config: dict):
     cleanup_steps = []
     if "webhook" in created:
         cleanup_steps.append(("webhook", delete_webhook))
+    if "dns" in created:
+        cleanup_steps.append(("DNS record", delete_dns_record))
     if "tunnel" in created:
-        cleanup_steps.extend([
-            ("DNS record", delete_dns_record),
-            ("tunnel", delete_tunnel),
-        ])
+        cleanup_steps.append(("tunnel", delete_tunnel))
     if "server" in created:
         cleanup_steps.append(("server", delete_server))
 
@@ -429,10 +430,9 @@ def main():
         print("[6/8] Injecting auth tokens...")
         inject_auth(ip, config)
 
-        # 7. Cloudflare Tunnel
+        # 7. Cloudflare Tunnel (setup_tunnel updates `created` progressively)
         print("[7/8] Setting up Cloudflare Tunnel...")
-        hostname = setup_tunnel(config, ip)
-        created["tunnel"] = hostname
+        hostname = setup_tunnel(config, ip, created=created)
 
         # 8. GitHub webhook + start service
         print("[8/8] Creating webhook and starting service...")
@@ -441,15 +441,25 @@ def main():
         created["webhook"] = hostname
         ssh(ip, "systemctl restart pr-review")
 
-        # Verify the service actually started
-        print("  Verifying service started...")
-        time.sleep(2)  # Brief pause for systemd to settle
-        svc_status = ssh(ip, "systemctl is-active pr-review", timeout=10)
+        # Verify the service actually started (retry to allow systemd to settle)
+        print("  Verifying service started...", end="", flush=True)
+        svc_status = "unknown"
+        for _ in range(6):
+            time.sleep(2)
+            svc_status = ssh(
+                ip, "systemctl is-active pr-review 2>/dev/null || echo inactive",
+                timeout=10,
+            )
+            if svc_status == "active":
+                break
+            print(".", end="", flush=True)
         if svc_status != "active":
+            print()
             raise ProvisionError(
                 f"Service pr-review is '{svc_status}' after restart. "
                 f"Check logs: ssh root@{ip} journalctl -u pr-review --no-pager -n 50"
             )
+        print(" ok")
 
         # Summary
         print()

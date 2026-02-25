@@ -1,5 +1,7 @@
 """Tests for provisioning scripts (config loading, API construction)."""
 
+import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -120,6 +122,32 @@ class TestLoadConfig:
         config = load_config(root)
         assert config["CF_API_TOKEN"] == "abc=def=ghi"
 
+    def test_strips_inline_comments(self, tmp_path):
+        from _common import load_config
+
+        env = self._full_env(HCLOUD_TOKEN="real-token # this is a comment")
+        root = self._write_env(tmp_path, env)
+        config = load_config(root)
+        assert config["HCLOUD_TOKEN"] == "real-token"
+
+    def test_preserves_hash_without_leading_space(self, tmp_path):
+        from _common import load_config
+
+        # A bare # without a leading space is NOT an inline comment
+        env = self._full_env(HCLOUD_TOKEN="token#nospace")
+        root = self._write_env(tmp_path, env)
+        config = load_config(root)
+        assert config["HCLOUD_TOKEN"] == "token#nospace"
+
+    def test_preserves_hash_in_quoted_values(self, tmp_path):
+        from _common import load_config
+
+        # Inline comments are not stripped inside quoted values
+        env = self._full_env(HCLOUD_TOKEN='"value # with hash"')
+        root = self._write_env(tmp_path, env)
+        config = load_config(root)
+        assert config["HCLOUD_TOKEN"] == "value # with hash"
+
 
 # ── SSH key detection ──────────────────────────────────────
 
@@ -199,18 +227,92 @@ class TestCfRequest:
             cf_request("GET", "/test", "token")
 
 
+# ── GitHub pagination ──────────────────────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestGhPaginate:
+    @patch("_common.requests.get")
+    def test_single_page(self, mock_get):
+        from _common import gh_paginate
+
+        mock_get.return_value = _gh_response(200, [{"id": 1}, {"id": 2}])
+
+        items = gh_paginate(
+            "https://api.github.com/orgs/x/hooks",
+            headers={"Authorization": "Bearer tok"},
+            params={"per_page": 100},
+        )
+        assert items == [{"id": 1}, {"id": 2}]
+        mock_get.assert_called_once()
+
+    @patch("_common.requests.get")
+    def test_follows_next_link(self, mock_get):
+        from _common import gh_paginate
+
+        page1 = _gh_response(200, [{"id": 1}], headers={
+            "Link": '<https://api.github.com/orgs/x/hooks?page=2>; rel="next"',
+        })
+        page2 = _gh_response(200, [{"id": 2}])
+        mock_get.side_effect = [page1, page2]
+
+        items = gh_paginate(
+            "https://api.github.com/orgs/x/hooks",
+            headers={"Authorization": "Bearer tok"},
+            params={"per_page": 100},
+        )
+        assert items == [{"id": 1}, {"id": 2}]
+        assert mock_get.call_count == 2
+        # Second call should use the URL from the Link header, no params
+        second_call = mock_get.call_args_list[1]
+        assert second_call[0][0] == "https://api.github.com/orgs/x/hooks?page=2"
+        assert second_call[1]["params"] is None
+
+    @patch("_common.requests.get")
+    def test_raises_on_error(self, mock_get):
+        from _common import ProvisionError, gh_paginate
+
+        mock_get.return_value = _gh_response(403, text="Forbidden")
+
+        with pytest.raises(ProvisionError, match="403"):
+            gh_paginate(
+                "https://api.github.com/orgs/x/hooks",
+                headers={"Authorization": "Bearer tok"},
+            )
+
+    @patch("_common.requests.get")
+    def test_follows_multiple_pages(self, mock_get):
+        from _common import gh_paginate
+
+        page1 = _gh_response(200, [{"id": 1}], headers={
+            "Link": '<https://api.github.com/orgs/x/hooks?page=2>; rel="next", '
+                    '<https://api.github.com/orgs/x/hooks?page=3>; rel="last"',
+        })
+        page2 = _gh_response(200, [{"id": 2}], headers={
+            "Link": '<https://api.github.com/orgs/x/hooks?page=3>; rel="next"',
+        })
+        page3 = _gh_response(200, [{"id": 3}])
+        mock_get.side_effect = [page1, page2, page3]
+
+        items = gh_paginate(
+            "https://api.github.com/orgs/x/hooks",
+            headers={"Authorization": "Bearer tok"},
+            params={"per_page": 100},
+        )
+        assert items == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert mock_get.call_count == 3
+
+
 # ── GitHub webhook construction ────────────────────────────
 
 
 @pytest.mark.usefixtures("scripts_on_path")
 class TestCreateWebhook:
-    @patch("provision.requests.get")
+    @patch("provision.gh_paginate", return_value=[])
     @patch("provision.requests.post")
-    def test_posts_correct_payload(self, mock_post, mock_get):
+    def test_posts_correct_payload(self, mock_post, mock_paginate):
         from provision import create_webhook
 
-        # No existing webhooks
-        mock_get.return_value = _gh_response(200, [])
         mock_post.return_value = _gh_response(201, {"id": 42})
 
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
@@ -223,27 +325,26 @@ class TestCreateWebhook:
         assert payload["events"] == ["pull_request"]
         assert payload["active"] is True
 
-    @patch("provision.requests.get")
+    @patch("provision.gh_paginate", return_value=[])
     @patch("provision.requests.post")
-    def test_raises_on_failure(self, mock_post, mock_get):
+    def test_raises_on_failure(self, mock_post, mock_paginate):
         from _common import ProvisionError
         from provision import create_webhook
 
-        mock_get.return_value = _gh_response(200, [])
         mock_post.return_value = _gh_response(422, text="Validation failed")
 
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
         with pytest.raises(ProvisionError, match="422"):
             create_webhook(config, "secret", "host.example.com")
 
-    @patch("provision.requests.get")
+    @patch("provision.gh_paginate")
     @patch("provision.requests.post")
-    def test_skips_when_webhook_exists(self, mock_post, mock_get):
+    def test_skips_when_webhook_exists(self, mock_post, mock_paginate):
         from provision import create_webhook
 
-        mock_get.return_value = _gh_response(
-            200, [{"id": 99, "config": {"url": "https://pr-review.example.com/webhook"}}],
-        )
+        mock_paginate.return_value = [
+            {"id": 99, "config": {"url": "https://pr-review.example.com/webhook"}},
+        ]
 
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
         create_webhook(config, "secret123", "pr-review.example.com")
@@ -256,15 +357,15 @@ class TestCreateWebhook:
 
 @pytest.mark.usefixtures("scripts_on_path")
 class TestDestroy:
-    @patch("destroy.requests.get")
+    @patch("destroy.gh_paginate")
     @patch("destroy.requests.delete")
-    def test_delete_webhook_finds_and_deletes(self, mock_delete, mock_get):
+    def test_delete_webhook_finds_and_deletes(self, mock_delete, mock_paginate):
         from destroy import delete_webhook
 
-        mock_get.return_value = _gh_response(200, [
+        mock_paginate.return_value = [
             {"id": 1, "config": {"url": "https://other.example.com/webhook"}},
             {"id": 2, "config": {"url": "https://pr-review.example.com/webhook"}},
-        ])
+        ]
         mock_delete.return_value = MagicMock(status_code=204)
 
         config = {
@@ -291,11 +392,11 @@ class TestDestroy:
 
         mock_client.servers.delete.assert_called_once_with(mock_server)
 
-    @patch("destroy.requests.get")
-    def test_delete_webhook_uses_pagination(self, mock_get):
+    @patch("destroy.gh_paginate")
+    def test_delete_webhook_passes_per_page(self, mock_paginate):
         from destroy import delete_webhook
 
-        mock_get.return_value = _gh_response(200, [])
+        mock_paginate.return_value = []
 
         config = {
             "GITHUB_ORG": "myorg",
@@ -304,16 +405,16 @@ class TestDestroy:
         }
         delete_webhook(config)
 
-        # Verify per_page=100 is sent
-        call_kwargs = mock_get.call_args
+        # Verify per_page=100 is passed to gh_paginate
+        call_kwargs = mock_paginate.call_args
         assert call_kwargs[1]["params"]["per_page"] == 100
 
-    @patch("destroy.requests.get")
-    def test_delete_webhook_raises_on_list_failure(self, mock_get):
+    @patch("destroy.gh_paginate")
+    def test_delete_webhook_raises_on_list_failure(self, mock_paginate):
         from _common import ProvisionError
         from destroy import delete_webhook
 
-        mock_get.return_value = _gh_response(403, text="Forbidden")
+        mock_paginate.side_effect = ProvisionError("GitHub API error (403): Forbidden")
 
         config = {
             "GITHUB_ORG": "myorg",
@@ -322,41 +423,6 @@ class TestDestroy:
         }
         with pytest.raises(ProvisionError, match="403"):
             delete_webhook(config)
-
-
-# ── Pagination overflow detection ─────────────────────────
-
-
-@pytest.mark.usefixtures("scripts_on_path")
-class TestCheckPagination:
-    def test_no_link_header_passes(self):
-        from _common import check_pagination
-
-        resp = _gh_response(200, [])
-        check_pagination(resp, "webhooks")  # should not raise
-
-    def test_link_header_with_next_raises(self):
-        from _common import ProvisionError, check_pagination
-
-        resp = _gh_response(200, [], headers={
-            "Link": '<https://api.github.com/orgs/myorg/hooks?page=2>; rel="next"',
-        })
-        with pytest.raises(ProvisionError, match="paginated webhooks"):
-            check_pagination(resp, "webhooks")
-
-    @patch("provision.requests.get")
-    @patch("provision.requests.post")
-    def test_create_webhook_raises_on_pagination(self, mock_post, mock_get):
-        from _common import ProvisionError
-        from provision import create_webhook
-
-        mock_get.return_value = _gh_response(200, [], headers={
-            "Link": '<https://api.github.com/orgs/x/hooks?page=2>; rel="next"',
-        })
-        config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
-        with pytest.raises(ProvisionError, match="paginated"):
-            create_webhook(config, "secret", "host.example.com")
-        mock_post.assert_not_called()
 
 
 # ── Auto-cleanup on provision failure ─────────────────────
@@ -368,7 +434,7 @@ class TestAutoCleanup:
         from provision import _auto_cleanup
 
         config = {"SERVER_NAME": "test", "GITHUB_ORG": "org", "TUNNEL_HOSTNAME": "h"}
-        created = {"server": "test", "tunnel": "h", "webhook": "h"}
+        created = {"server": "test", "tunnel": "h", "dns": "h", "webhook": "h"}
 
         with patch("destroy.delete_webhook") as dw, \
              patch("destroy.delete_dns_record") as dd, \
@@ -391,7 +457,7 @@ class TestAutoCleanup:
         from provision import _auto_cleanup
 
         config = {"SERVER_NAME": "test"}
-        created = {"server": "test", "tunnel": "h"}
+        created = {"server": "test", "tunnel": "h", "dns": "h"}
 
         with patch("destroy.delete_dns_record", side_effect=Exception("boom")), \
              patch("destroy.delete_tunnel") as dt, \
@@ -401,6 +467,21 @@ class TestAutoCleanup:
 
         dt.assert_called_once()
         ds.assert_called_once()
+
+    def test_auto_cleanup_cleans_dns_without_tunnel(self):
+        """DNS should be cleaned up even if tunnel tracking is absent."""
+        from provision import _auto_cleanup
+
+        config = {"SERVER_NAME": "test"}
+        # DNS was created but setup_tunnel failed before recording "tunnel"
+        created = {"server": "test", "dns": "h"}
+
+        with patch("destroy.delete_dns_record") as dd, \
+             patch("destroy.delete_server") as ds:
+            _auto_cleanup(created, config)
+
+        dd.assert_called_once_with(config)
+        ds.assert_called_once_with(config)
 
     def test_main_handles_config_failure_without_unbound_error(self):
         """Regression test: load_config failure must not cause UnboundLocalError."""
@@ -516,3 +597,232 @@ class TestSetupTunnel:
 
         with pytest.raises(ProvisionError, match="cloudflared install failed"):
             setup_tunnel(self._config(), "1.2.3.4")
+
+    @patch("provision.subprocess.run")
+    @patch("provision.cf_request")
+    def test_updates_created_dict_progressively(self, mock_cf, mock_run):
+        """setup_tunnel should track tunnel and DNS in `created` for cleanup."""
+        from provision import setup_tunnel
+
+        mock_cf.side_effect = [
+            {"result": []},
+            {"result": {"id": "tun-new"}},
+            {"result": {}},
+            {"result": []},
+            {"result": {}},
+            {"result": "tok"},
+        ]
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        created = {}
+        setup_tunnel(self._config(), "1.2.3.4", created=created)
+
+        assert "tunnel" in created
+        assert "dns" in created
+
+    @patch("provision.subprocess.run")
+    @patch("provision.cf_request")
+    def test_tracks_dns_even_if_cloudflared_fails(self, mock_cf, mock_run):
+        """DNS should be tracked even if cloudflared install fails after."""
+        from _common import ProvisionError
+        from provision import setup_tunnel
+
+        mock_cf.side_effect = [
+            {"result": [{"id": "tun-1"}]},
+            {"result": {}},
+            {"result": []},
+            {"result": {}},
+            {"result": "tok"},
+        ]
+        mock_run.return_value = MagicMock(returncode=1, stderr="fail")
+
+        created = {}
+        with pytest.raises(ProvisionError):
+            setup_tunnel(self._config(), "1.2.3.4", created=created)
+
+        # DNS and tunnel should be tracked even though cloudflared failed
+        assert "tunnel" in created
+        assert "dns" in created
+
+
+# ── wait_for_ssh ──────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestWaitForSsh:
+    @patch("_common.time.sleep")
+    @patch("_common.ssh")
+    def test_returns_when_ssh_ready(self, mock_ssh, mock_sleep):
+        from _common import wait_for_ssh
+
+        mock_ssh.return_value = "ready"
+        wait_for_ssh("1.2.3.4", timeout=30)
+
+        mock_ssh.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    @patch("_common.time.sleep")
+    @patch("_common.time.time")
+    @patch("_common.ssh")
+    def test_retries_on_failure_then_succeeds(self, mock_ssh, mock_time, mock_sleep):
+        from _common import ProvisionError, wait_for_ssh
+
+        # First call fails, second succeeds
+        mock_ssh.side_effect = [ProvisionError("refused"), "ready"]
+        # time() returns: start, check1 (still in window), check2 (still in window)
+        mock_time.side_effect = [0, 1, 6]
+
+        wait_for_ssh("1.2.3.4", timeout=30)
+
+        assert mock_ssh.call_count == 2
+        assert mock_sleep.call_count == 1
+
+    @patch("_common.time.sleep")
+    @patch("_common.time.time")
+    @patch("_common.ssh")
+    def test_raises_after_timeout(self, mock_ssh, mock_time, mock_sleep):
+        from _common import ProvisionError, wait_for_ssh
+
+        mock_ssh.side_effect = ProvisionError("refused")
+        # time() returns: start, first check (past deadline)
+        mock_time.side_effect = [0, 301]
+
+        with pytest.raises(ProvisionError, match="SSH not reachable after 300s"):
+            wait_for_ssh("1.2.3.4", timeout=300)
+
+
+# ── wait_for_cloud_init ──────────────────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestWaitForCloudInit:
+    @patch("_common.time.sleep")
+    @patch("_common.ssh")
+    def test_returns_when_done(self, mock_ssh, mock_sleep):
+        from _common import wait_for_cloud_init
+
+        mock_ssh.return_value = json.dumps({"status": "done"})
+        wait_for_cloud_init("1.2.3.4", timeout=60)
+
+        mock_ssh.assert_called_once()
+
+    @patch("_common.time.sleep")
+    @patch("_common.ssh")
+    def test_raises_cloud_init_error(self, mock_ssh, mock_sleep):
+        from _common import CloudInitError, wait_for_cloud_init
+
+        mock_ssh.return_value = json.dumps({
+            "status": "error",
+            "extended_status": "modules failed",
+        })
+
+        with pytest.raises(CloudInitError, match="cloud-init failed"):
+            wait_for_cloud_init("1.2.3.4", timeout=60)
+
+    @patch("_common.time.sleep")
+    @patch("_common.time.time")
+    @patch("_common.ssh")
+    def test_raises_after_timeout(self, mock_ssh, mock_time, mock_sleep):
+        from _common import ProvisionError, wait_for_cloud_init
+
+        mock_ssh.return_value = json.dumps({"status": "running"})
+        # time() returns: start, first check (still in window), second check (past deadline)
+        mock_time.side_effect = [0, 1, 601]
+
+        with pytest.raises(ProvisionError, match="cloud-init did not finish"):
+            wait_for_cloud_init("1.2.3.4", timeout=600)
+
+    @patch("_common.time.sleep")
+    @patch("_common.time.time")
+    @patch("_common.ssh")
+    def test_retries_on_transient_ssh_failure(self, mock_ssh, mock_time, mock_sleep):
+        from _common import ProvisionError, wait_for_cloud_init
+
+        # First call fails with SSH error, second returns done
+        mock_ssh.side_effect = [
+            ProvisionError("connection refused"),
+            json.dumps({"status": "done"}),
+        ]
+        # time() calls: deadline calc, while-check, remaining calc, while-check
+        mock_time.side_effect = [0, 1, 11, 15]
+
+        wait_for_cloud_init("1.2.3.4", timeout=60)
+
+        assert mock_ssh.call_count == 2
+
+
+# ── inject_auth ──────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("scripts_on_path")
+class TestInjectAuth:
+    def _config(self):
+        return {
+            "GH_TOKEN": "ghp_test_token",
+            "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
+        }
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_raises_when_gh_not_installed(self, mock_ssh, mock_run):
+        from _common import ProvisionError
+        from provision import inject_auth
+
+        mock_ssh.side_effect = ProvisionError("command not found")
+
+        with pytest.raises(ProvisionError, match="GitHub CLI.*not found"):
+            inject_auth("1.2.3.4", self._config())
+
+        # subprocess.run should not have been called (gh check failed first)
+        mock_run.assert_not_called()
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_raises_on_gh_auth_failure(self, mock_ssh, mock_run):
+        from _common import ProvisionError
+        from provision import inject_auth
+
+        # gh preflight succeeds
+        mock_ssh.return_value = "/usr/bin/gh"
+        # gh auth login fails
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr="auth error", stdout="",
+        )
+
+        with pytest.raises(ProvisionError, match="GitHub CLI auth failed"):
+            inject_auth("1.2.3.4", self._config())
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_succeeds_with_all_steps(self, mock_ssh, mock_run):
+        from provision import inject_auth
+
+        mock_ssh.return_value = "/usr/bin/gh"
+        # 3 subprocess.run calls: gh auth, mktemp upload, python3 upsert
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr="", stdout=""),          # gh auth login
+            MagicMock(returncode=0, stderr="", stdout="/tmp/xyz"),  # mktemp upload
+            MagicMock(returncode=0, stderr="", stdout=""),          # python3 upsert
+        ]
+
+        inject_auth("1.2.3.4", self._config())  # should not raise
+
+        assert mock_run.call_count == 3
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_pipes_gh_token_via_stdin(self, mock_ssh, mock_run):
+        from provision import inject_auth
+
+        mock_ssh.return_value = "/usr/bin/gh"
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr="", stdout=""),
+            MagicMock(returncode=0, stderr="", stdout="/tmp/xyz"),
+            MagicMock(returncode=0, stderr="", stdout=""),
+        ]
+
+        inject_auth("1.2.3.4", self._config())
+
+        # First subprocess.run call should pipe GH_TOKEN via stdin
+        first_call = mock_run.call_args_list[0]
+        assert first_call[1]["input"] == "ghp_test_token"
