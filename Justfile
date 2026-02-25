@@ -37,7 +37,7 @@ provision:
 # Destroy the server and clean up tunnel/webhook/DNS (pass "yes" to confirm)
 destroy confirm="":
     @[ "{{ confirm }}" = "yes" ] || (echo "This will delete the server and all associated resources."; echo "Run: just destroy yes"; exit 1)
-    uv run python scripts/destroy.py
+    uv run python scripts/destroy.py --yes
 
 # Check server status and health
 status:

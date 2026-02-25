@@ -51,24 +51,33 @@ def main():
     print(f"Logs:     ssh root@{ip} journalctl -u pr-review -f")
 
     if server.status != "running":
-        return
+        sys.exit(1)
 
     # Check service health via SSH
+    healthy = True
     print()
     try:
         svc = ssh(ip, "systemctl is-active pr-review 2>/dev/null || echo inactive", timeout=10)
         print(f"Service:  {svc}")
+        if svc != "active":
+            healthy = False
     except Exception:
         print("Service:  (SSH unreachable)")
-        return
+        sys.exit(1)
 
     try:
         # Port 8081 is the dedicated Caddy health endpoint (separate from the
         # application on PORT=8080); see infra/cloud-init.tmpl.yaml.
         health = ssh(ip, "curl -sf localhost:8081/health 2>/dev/null || echo 'unreachable'", timeout=10)
         print(f"Health:   {health}")
+        if health != "ok" and "unreachable" in health:
+            healthy = False
     except Exception:
         print("Health:   (check failed)")
+        healthy = False
+
+    if not healthy:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

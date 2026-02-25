@@ -37,13 +37,14 @@ DEFAULTS = {
 # server we just created, the MITM window is minimal and this is standard
 # practice for cloud provisioning.
 #
-# UserKnownHostsFile is isolated from ~/.ssh/known_hosts so that
-# destroy-then-reprovision cycles (which may reuse IPs with new host keys)
-# don't trigger "REMOTE HOST IDENTIFICATION HAS CHANGED" errors in the
-# user's personal known_hosts.
+# UserKnownHostsFile=/dev/null prevents host key conflicts on
+# destroy-then-reprovision cycles (which may reuse IPs with new host keys).
+# Combined with StrictHostKeyChecking=no (needed because /dev/null means
+# every connection looks "new"), this is appropriate for single-tenant
+# ephemeral infrastructure managed by these scripts.
 SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=/tmp/pr-review-known-hosts",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
     "-o", "ConnectTimeout=10",
     "-o", "BatchMode=yes",
 ]

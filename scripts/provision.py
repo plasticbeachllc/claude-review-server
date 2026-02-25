@@ -130,6 +130,15 @@ def inject_auth(ip: str, config: dict):
 
     Uses upsert logic so re-running is safe (no duplicate tokens).
     """
+    # Preflight: verify gh CLI is installed (cloud-init may not have finished)
+    try:
+        ssh(ip, "command -v gh", timeout=10, label="check gh installed")
+    except ProvisionError:
+        raise ProvisionError(
+            f"GitHub CLI (gh) not found on server. "
+            f"Check cloud-init logs: ssh root@{ip} cloud-init status --long"
+        )
+
     # GitHub CLI auth — pipe token via stdin to avoid exposing it in process args
     print("  Authenticating GitHub CLI...")
     result = subprocess.run(
@@ -144,8 +153,9 @@ def inject_auth(ip: str, config: dict):
         )
 
     # Claude Code auth — upsert token in the service env file.
-    # SCP a small Python script to the server to avoid fragile shell quoting.
-    # Token is read from stdin to avoid leaking into process args.
+    # Uses mktemp for a unique, restricted-permission temp file to avoid
+    # the security issues of a predictable world-readable path.
+    # Token is piped via stdin to avoid leaking into process args.
     print("  Injecting Claude Code auth token...")
     upsert_script = (
         "import sys\n"
@@ -158,9 +168,10 @@ def inject_auth(ip: str, config: dict):
         "    new_lines.append(key + token + '\\n')\n"
         "open(path, 'w').writelines(new_lines)\n"
     )
-    # Write script to server via stdin, then execute it with token on stdin
+    # Upload script to a secure temp file (mktemp + chmod 700)
     scp_result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"root@{ip}", "cat > /tmp/_upsert_env.py"],
+        ["ssh", *SSH_OPTS, f"root@{ip}",
+         "TMPF=$(mktemp) && chmod 700 \"$TMPF\" && cat > \"$TMPF\" && echo \"$TMPF\""],
         input=upsert_script, capture_output=True, text=True, timeout=10,
     )
     if scp_result.returncode != 0:
@@ -168,8 +179,9 @@ def inject_auth(ip: str, config: dict):
             f"Failed to upload upsert script (rc={scp_result.returncode})\n"
             f"stderr: {scp_result.stderr.strip()}"
         )
+    tmpf = scp_result.stdout.strip()
     result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"root@{ip}", "python3 /tmp/_upsert_env.py; rm -f /tmp/_upsert_env.py"],
+        ["ssh", *SSH_OPTS, f"root@{ip}", f"python3 {tmpf} && rm -f {tmpf}"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
         capture_output=True, text=True, timeout=30,
     )
@@ -428,6 +440,16 @@ def main():
         create_webhook(config, webhook_secret, hostname)
         created["webhook"] = hostname
         ssh(ip, "systemctl restart pr-review")
+
+        # Verify the service actually started
+        print("  Verifying service started...")
+        time.sleep(2)  # Brief pause for systemd to settle
+        svc_status = ssh(ip, "systemctl is-active pr-review", timeout=10)
+        if svc_status != "active":
+            raise ProvisionError(
+                f"Service pr-review is '{svc_status}' after restart. "
+                f"Check logs: ssh root@{ip} journalctl -u pr-review --no-pager -n 50"
+            )
 
         # Summary
         print()

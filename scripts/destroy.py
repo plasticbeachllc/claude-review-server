@@ -119,6 +119,9 @@ def main():
     root = Path(__file__).resolve().parent.parent
     errors = []
 
+    # Accept --yes flag or positional "yes" to skip interactive confirmation
+    skip_confirm = "--yes" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "yes")
+
     try:
         config = load_config(root)
     except ProvisionError as e:
@@ -126,6 +129,18 @@ def main():
         sys.exit(1)
 
     name = config.get("SERVER_NAME", "pr-review")
+
+    if not skip_confirm:
+        print(f"This will delete server '{name}' and all associated resources.")
+        try:
+            answer = input("Type 'yes' to confirm: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(1)
+        if answer != "yes":
+            print("Aborted.")
+            sys.exit(1)
+
     print(f"Destroying '{name}' and associated resources...\n")
 
     steps = [
