@@ -23,11 +23,11 @@ deploy host:
 # Set up Origin CA TLS (for custom domain users — see README)
 # Usage: just setup-tls root@server origin.pem origin-key.pem
 setup-tls host cert key:
-    ssh {{host}} 'mkdir -p /etc/caddy/certs'
+    ssh {{host}} 'mkdir -p /etc/caddy/certs && chown caddy:caddy /etc/caddy/certs && chmod 700 /etc/caddy/certs'
     scp {{cert}} {{host}}:/etc/caddy/certs/origin.pem
     scp {{key}} {{host}}:/etc/caddy/certs/origin-key.pem
     scp Caddyfile.origin-ca {{host}}:/etc/caddy/Caddyfile
-    ssh {{host}} 'chown caddy:caddy /etc/caddy/certs/origin.pem /etc/caddy/certs/origin-key.pem && chmod 644 /etc/caddy/certs/origin.pem && chmod 600 /etc/caddy/certs/origin-key.pem && ufw allow 443/tcp && systemctl restart caddy'
+    ssh {{host}} 'chown caddy:caddy /etc/caddy/certs/origin.pem /etc/caddy/certs/origin-key.pem && chmod 644 /etc/caddy/certs/origin.pem && chmod 600 /etc/caddy/certs/origin-key.pem && ufw allow 443/tcp && caddy validate --config /etc/caddy/Caddyfile && systemctl restart caddy && systemctl is-active --quiet caddy'
     @echo "✓ TLS configured — Caddy now serving on :443"
 
 # Run tests
