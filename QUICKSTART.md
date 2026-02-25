@@ -28,7 +28,7 @@ GitHub webhook → Cloudflare (TLS) → Caddy (reverse proxy) → Python agent �
 
 ## Cost
 
-~€4–5/month for a CX22 server. Claude usage comes from your existing subscription.
+~$4/month for a CX11 server. Claude usage comes from your existing subscription.
 
 ---
 
@@ -52,7 +52,7 @@ Then under **SSL/TLS → Overview**, set the encryption mode to **Full (Strict)*
 2. Configure:
    - **Location:** Whichever is closest to you
    - **Image:** Ubuntu 24.04
-   - **Type:** CX22 (2 vCPU, 4 GB RAM)
+   - **Type:** CX11
    - **Networking:** Public IPv4 + IPv6
    - **SSH Key:** Select your key
    - **Cloud config:** Expand the section at the bottom and paste the entire contents of [`cloud-init.yaml`](./cloud-init.yaml)
