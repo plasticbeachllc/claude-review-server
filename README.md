@@ -200,5 +200,5 @@ Edit `LOW_PRIORITY_PATTERNS` in `agent.py` to control which files get dropped fi
 |------|-----------|-----|
 | Renew Claude token | Yearly | `claude setup-token`, update `.env`, restart |
 | Renew Origin CA cert | 15 years | Regenerate in Cloudflare, replace cert files |
-| Update Claude Code | As needed | `npm update -g @anthropic-ai/claude-code` |
+| Update Claude Code | As needed | Bump version in `cloud-init.tmpl.yaml`, `just build` |
 | System packages | Monthly | `apt update && apt upgrade` |

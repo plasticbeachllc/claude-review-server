@@ -217,13 +217,18 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             log.warning(f"Empty diff for {repo}#{pr_number}")
             return
 
+        # Escape braces in untrusted content so .format() doesn't choke
+        # on diffs/bodies containing {variable_name} patterns.
+        def esc(s: str) -> str:
+            return s.replace("{", "{{").replace("}", "}}")
+
         prompt = get_prompt_template().format(
             pr_number=pr_number,
             repo=repo,
-            pr_title=pr_title,
-            pr_body=pr_body or "(none)",
+            pr_title=esc(pr_title),
+            pr_body=esc(pr_body) or "(none)",
             truncation_note=truncation_note,
-            diff=diff,
+            diff=esc(diff),
         )
 
         result = subprocess.run(
