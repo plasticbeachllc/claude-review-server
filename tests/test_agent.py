@@ -165,6 +165,7 @@ class TestSmartTruncateDiff:
 # ── build.py ─────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("scripts_on_path")
 class TestBuild:
     def test_build_produces_valid_output(self):
         from build import build
