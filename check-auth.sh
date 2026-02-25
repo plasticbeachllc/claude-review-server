@@ -33,7 +33,7 @@ alert() {
 
     if [[ "$existing" != "0" ]]; then
         echo "Alert issue already open, skipping"
-        exit 1
+        exit 0
     fi
 
     gh issue create --repo "$ALERT_REPO" \

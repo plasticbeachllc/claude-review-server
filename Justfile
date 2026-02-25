@@ -7,7 +7,12 @@ build:
 
 # Validate the built cloud-init.yaml (requires cloud-init installed)
 validate: build
-    cloud-init schema --config-file cloud-init.yaml || echo "Note: install cloud-init for full validation"
+    #!/usr/bin/env bash
+    if ! command -v cloud-init &>/dev/null; then
+        echo "Note: cloud-init not installed, skipping validation"
+        exit 0
+    fi
+    cloud-init schema --config-file cloud-init.yaml
 
 # Deploy agent files to a running server (requires SSH access)
 deploy host:

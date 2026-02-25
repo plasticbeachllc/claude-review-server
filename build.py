@@ -35,7 +35,7 @@ def build(root: Path) -> str:
 
         content = source.read_text()
         # Indent every line of the source file to match the YAML level
-        for i, src_line in enumerate(content.splitlines()):
+        for src_line in content.splitlines():
             if src_line:
                 out.append(indent + src_line + "\n")
             else:

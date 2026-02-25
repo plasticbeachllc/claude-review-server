@@ -33,12 +33,20 @@ logging.root.setLevel(logging.INFO)
 log = logging.getLogger("pr-review")
 
 # ── Configuration ────────────────────────────────────────
-WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]  # tests must set before import
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROMPT_TEMPLATE = (SCRIPT_DIR / "prompt.md").read_text()
+_prompt_template: str | None = None
+
+
+def get_prompt_template() -> str:
+    """Lazy-load the prompt template on first use."""
+    global _prompt_template
+    if _prompt_template is None:
+        _prompt_template = (SCRIPT_DIR / "prompt.md").read_text()
+    return _prompt_template
 
 # Files to drop first when truncating large diffs
 LOW_PRIORITY_PATTERNS = [
@@ -203,7 +211,7 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             log.warning(f"Empty diff for {repo}#{pr_number}")
             return
 
-        prompt = PROMPT_TEMPLATE.format(
+        prompt = get_prompt_template().format(
             pr_number=pr_number,
             repo=repo,
             pr_title=pr_title,
@@ -317,9 +325,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if not WEBHOOK_SECRET:
-        log.error("GITHUB_WEBHOOK_SECRET environment variable is required")
-        sys.exit(1)
     WORKDIR.mkdir(parents=True, exist_ok=True)
     port = int(os.environ.get("PORT", "8080"))
     server = HTTPServer(("127.0.0.1", port), WebhookHandler)
