@@ -37,8 +37,7 @@ def delete_webhook(config: dict):
         headers=headers, params={"per_page": 100}, timeout=30,
     )
     if resp.status_code != 200:
-        print(f"  Warning: could not list webhooks ({resp.status_code})")
-        return
+        raise ProvisionError(f"Could not list webhooks ({resp.status_code}): {resp.text}")
 
     for hook in resp.json():
         hook_url = hook.get("config", {}).get("url", "")

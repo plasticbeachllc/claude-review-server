@@ -1,5 +1,7 @@
 """Shared utilities for provisioning scripts."""
 
+import subprocess
+import time
 from pathlib import Path
 
 import requests
@@ -24,7 +26,20 @@ DEFAULTS = {
     "SERVER_NAME": "pr-review",
     "SERVER_TYPE": "cx22",
     "SERVER_LOCATION": "fsn1",
+    "SERVER_IMAGE": "ubuntu-24.04",
 }
+
+# SSH options for connecting to provisioned servers.
+# StrictHostKeyChecking=accept-new trusts the key on first connection and
+# rejects if it changes later.  The Hetzner API does not expose server host
+# keys, so there is no way to pre-seed known_hosts.  Since we connect to a
+# server we just created, the MITM window is minimal and this is standard
+# practice for cloud provisioning.
+SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=10",
+    "-o", "BatchMode=yes",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +47,10 @@ DEFAULTS = {
 # ---------------------------------------------------------------------------
 class ProvisionError(Exception):
     """Raised when a provisioning step fails."""
+
+
+class CloudInitError(ProvisionError):
+    """Raised specifically when cloud-init reports an error status."""
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +86,69 @@ def load_config(root: Path) -> dict:
         raise ProvisionError(f"Missing required .env keys: {', '.join(missing)}")
 
     return config
+
+
+# ---------------------------------------------------------------------------
+# SSH helpers
+# ---------------------------------------------------------------------------
+def ssh(ip: str, cmd: str, timeout: int = 120, *, label: str = "") -> str:
+    """Run a command on the server via SSH. Returns stdout.
+
+    Use ``label`` to replace the raw command in error messages (avoids
+    leaking tokens when a sensitive command fails).
+    """
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"root@{ip}", cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        display = label or cmd
+        raise ProvisionError(
+            f"SSH command failed (rc={result.returncode}): {display}\n"
+            f"stderr: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def wait_for_ssh(ip: str, timeout: int = 300):
+    """Poll until SSH is reachable."""
+    print(f"  Waiting for SSH on {ip}...", end="", flush=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ssh(ip, "echo ready", timeout=10)
+            print(" ok")
+            return
+        except (ProvisionError, subprocess.TimeoutExpired):
+            print(".", end="", flush=True)
+            time.sleep(5)
+    raise ProvisionError(f"SSH not reachable after {timeout}s")
+
+
+def wait_for_cloud_init(ip: str, timeout: int = 600):
+    """Wait for cloud-init to finish on the server."""
+    import json
+
+    print("  Waiting for cloud-init to finish...", end="", flush=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = ssh(ip, "cloud-init status --format json 2>/dev/null || echo '{}'", timeout=30)
+            data = json.loads(out) if out else {}
+            status = data.get("status", "")
+            if status == "done":
+                print(" done")
+                return
+            if status == "error":
+                detail = data.get("detail", "unknown")
+                raise CloudInitError(f"cloud-init failed: {detail}")
+        except CloudInitError:
+            raise  # cloud-init errors must propagate immediately
+        except (ProvisionError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass  # transient SSH failures or parse errors — keep polling
+        print(".", end="", flush=True)
+        time.sleep(10)
+    raise ProvisionError(f"cloud-init did not finish within {timeout}s")
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ Usage:
 """
 
 import base64
-import json
 import secrets
 import shlex
 import subprocess
@@ -27,81 +26,21 @@ from hcloud.server_types import ServerType
 from hcloud.ssh_keys import SSHKey
 
 # ---------------------------------------------------------------------------
-# Reuse the existing build system
+# Reuse the existing build system and shared utilities
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import CF_API, GH_API, ProvisionError, cf_request, load_config  # noqa: E402
+from _common import (  # noqa: E402
+    CF_API,
+    GH_API,
+    SSH_OPTS,
+    ProvisionError,
+    cf_request,
+    load_config,
+    ssh,
+    wait_for_cloud_init,
+    wait_for_ssh,
+)
 from build import BuildError, build  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "ConnectTimeout=10",
-    "-o", "BatchMode=yes",
-]
-
-
-# ---------------------------------------------------------------------------
-# SSH helpers
-# ---------------------------------------------------------------------------
-def ssh(ip: str, cmd: str, timeout: int = 120, *, label: str = "") -> str:
-    """Run a command on the server via SSH. Returns stdout.
-
-    Use ``label`` to replace the raw command in error messages (avoids
-    leaking tokens when a sensitive command fails).
-    """
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"root@{ip}", cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if result.returncode != 0:
-        display = label or cmd
-        raise ProvisionError(
-            f"SSH command failed (rc={result.returncode}): {display}\n"
-            f"stderr: {result.stderr.strip()}"
-        )
-    return result.stdout.strip()
-
-
-def wait_for_ssh(ip: str, timeout: int = 300):
-    """Poll until SSH is reachable."""
-    print(f"  Waiting for SSH on {ip}...", end="", flush=True)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            ssh(ip, "echo ready", timeout=10)
-            print(" ok")
-            return
-        except (ProvisionError, subprocess.TimeoutExpired):
-            print(".", end="", flush=True)
-            time.sleep(5)
-    raise ProvisionError(f"SSH not reachable after {timeout}s")
-
-
-def wait_for_cloud_init(ip: str, timeout: int = 600):
-    """Wait for cloud-init to finish on the server."""
-    print("  Waiting for cloud-init to finish...", end="", flush=True)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            out = ssh(ip, "cloud-init status --format json 2>/dev/null || echo '{}'", timeout=30)
-            data = json.loads(out) if out else {}
-            status = data.get("status", "")
-            if status == "done":
-                print(" done")
-                return
-            if status == "error":
-                detail = data.get("detail", "unknown")
-                raise ProvisionError(f"cloud-init failed: {detail}")
-        except ProvisionError:
-            raise  # cloud-init failures must propagate immediately
-        except (subprocess.TimeoutExpired, json.JSONDecodeError):
-            pass
-        print(".", end="", flush=True)
-        time.sleep(10)
-    raise ProvisionError(f"cloud-init did not finish within {timeout}s")
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +50,7 @@ def find_local_pubkey() -> tuple[str, str]:
     """Find the user's SSH public key. Returns (name, public_key_content)."""
     candidates = [
         Path.home() / ".ssh" / "id_ed25519.pub",
+        Path.home() / ".ssh" / "id_ecdsa.pub",
         Path.home() / ".ssh" / "id_rsa.pub",
     ]
     for path in candidates:
@@ -118,7 +58,8 @@ def find_local_pubkey() -> tuple[str, str]:
             content = path.read_text().strip()
             return (path.stem, content)
     raise ProvisionError(
-        "No SSH public key found. Expected ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub"
+        "No SSH public key found. Expected ~/.ssh/id_ed25519.pub, "
+        "~/.ssh/id_ecdsa.pub, or ~/.ssh/id_rsa.pub"
     )
 
 
@@ -157,7 +98,7 @@ def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str
     response = client.servers.create(
         name=name,
         server_type=ServerType(name=config["SERVER_TYPE"]),
-        image=Image(name="ubuntu-24.04"),
+        image=Image(name=config["SERVER_IMAGE"]),
         location=Location(name=config["SERVER_LOCATION"]),
         ssh_keys=[ssh_key],
         user_data=cloud_init,
@@ -181,7 +122,10 @@ def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str
 # Auth injection
 # ---------------------------------------------------------------------------
 def inject_auth(ip: str, config: dict):
-    """Inject GitHub and Claude auth tokens into the server."""
+    """Inject GitHub and Claude auth tokens into the server.
+
+    Uses upsert logic so re-running is safe (no duplicate tokens).
+    """
     # GitHub CLI auth — pipe token via stdin to avoid exposing it in process args
     print("  Authenticating GitHub CLI...")
     result = subprocess.run(
@@ -195,11 +139,14 @@ def inject_auth(ip: str, config: dict):
             f"stderr: {result.stderr.strip()}"
         )
 
-    # Claude Code auth — append token to the service env file
+    # Claude Code auth — upsert token in the service env file
     print("  Injecting Claude Code auth token...")
-    claude_env_line = shlex.quote("CLAUDE_CODE_AUTH_TOKEN=" + config["CLAUDE_CODE_AUTH_TOKEN"])
-    ssh(ip, f"printf '%s\\n' {claude_env_line} >> /opt/pr-review/.env",
-        label="append CLAUDE_CODE_AUTH_TOKEN to /opt/pr-review/.env")
+    token_value = shlex.quote(config["CLAUDE_CODE_AUTH_TOKEN"])
+    ssh(ip,
+        f"grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env "
+        f"&& sed -i 's|^CLAUDE_CODE_AUTH_TOKEN=.*|CLAUDE_CODE_AUTH_TOKEN={token_value}|' /opt/pr-review/.env "
+        f"|| printf '%s\\n' 'CLAUDE_CODE_AUTH_TOKEN='{token_value} >> /opt/pr-review/.env",
+        label="upsert CLAUDE_CODE_AUTH_TOKEN in /opt/pr-review/.env")
 
 
 # ---------------------------------------------------------------------------

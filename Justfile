@@ -34,8 +34,9 @@ setup-tls host cert key:
 provision:
     uv run python scripts/provision.py
 
-# Destroy the server and clean up tunnel/webhook/DNS
-destroy:
+# Destroy the server and clean up tunnel/webhook/DNS (pass --yes to confirm)
+destroy confirm="":
+    @[ "{{ confirm }}" = "--yes" ] || (echo "This will delete the server and all associated resources."; echo "Run: just destroy --yes"; exit 1)
     uv run python scripts/destroy.py
 
 # Check server status and health

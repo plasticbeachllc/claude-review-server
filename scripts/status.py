@@ -15,8 +15,7 @@ from pathlib import Path
 from hcloud import Client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import ProvisionError, load_config  # noqa: E402
-from provision import ssh  # noqa: E402
+from _common import ProvisionError, load_config, ssh  # noqa: E402
 
 
 def main():

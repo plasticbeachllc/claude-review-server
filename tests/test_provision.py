@@ -46,6 +46,7 @@ class TestLoadConfig:
         assert config["SERVER_NAME"] == "pr-review"
         assert config["SERVER_TYPE"] == "cx22"
         assert config["SERVER_LOCATION"] == "fsn1"
+        assert config["SERVER_IMAGE"] == "ubuntu-24.04"
 
     def test_overrides_defaults(self, tmp_path):
         from _common import load_config
@@ -126,6 +127,17 @@ class TestFindLocalPubkey:
             name, content = find_local_pubkey()
         assert name == "id_ed25519"
         assert content.startswith("ssh-ed25519")
+
+    def test_finds_ecdsa(self, tmp_path):
+        from provision import find_local_pubkey
+
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "id_ecdsa.pub").write_text("ecdsa-sha2-nistp256 AAAA... user@host")
+
+        with patch("provision.Path.home", return_value=tmp_path):
+            name, content = find_local_pubkey()
+        assert name == "id_ecdsa"
 
     def test_falls_back_to_rsa(self, tmp_path):
         from provision import find_local_pubkey
@@ -307,3 +319,21 @@ class TestDestroy:
         # Verify per_page=100 is sent
         call_kwargs = mock_get.call_args
         assert call_kwargs[1]["params"]["per_page"] == 100
+
+    @patch("destroy.requests.get")
+    def test_delete_webhook_raises_on_list_failure(self, mock_get):
+        from _common import ProvisionError
+        from destroy import delete_webhook
+
+        mock_get.return_value = MagicMock(
+            status_code=403,
+            text="Forbidden",
+        )
+
+        config = {
+            "GITHUB_ORG": "myorg",
+            "GH_TOKEN": "ghp_test",
+            "TUNNEL_HOSTNAME": "pr-review.example.com",
+        }
+        with pytest.raises(ProvisionError, match="403"):
+            delete_webhook(config)
