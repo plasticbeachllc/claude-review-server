@@ -36,8 +36,14 @@ DEFAULTS = {
 # keys, so there is no way to pre-seed known_hosts.  Since we connect to a
 # server we just created, the MITM window is minimal and this is standard
 # practice for cloud provisioning.
+#
+# UserKnownHostsFile is isolated from ~/.ssh/known_hosts so that
+# destroy-then-reprovision cycles (which may reuse IPs with new host keys)
+# don't trigger "REMOTE HOST IDENTIFICATION HAS CHANGED" errors in the
+# user's personal known_hosts.
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "UserKnownHostsFile=/tmp/pr-review-known-hosts",
     "-o", "ConnectTimeout=10",
     "-o", "BatchMode=yes",
 ]
@@ -190,7 +196,12 @@ def cf_request(method: str, path: str, token: str, **kwargs) -> dict:
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         timeout=30, **kwargs,
     )
-    data = resp.json()
+    try:
+        data = resp.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        raise ProvisionError(
+            f"Cloudflare returned non-JSON response (HTTP {resp.status_code})"
+        )
     if not data.get("success"):
         errors = data.get("errors", [])
         raise ProvisionError(f"Cloudflare API error: {errors}")

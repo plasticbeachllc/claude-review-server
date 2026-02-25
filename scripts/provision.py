@@ -159,11 +159,15 @@ def inject_auth(ip: str, config: dict):
         "open(path, 'w').writelines(new_lines)\n"
     )
     # Write script to server via stdin, then execute it with token on stdin
-    subprocess.run(
+    scp_result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}", "cat > /tmp/_upsert_env.py"],
         input=upsert_script, capture_output=True, text=True, timeout=10,
-        check=True,
     )
+    if scp_result.returncode != 0:
+        raise ProvisionError(
+            f"Failed to upload upsert script (rc={scp_result.returncode})\n"
+            f"stderr: {scp_result.stderr.strip()}"
+        )
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}", "python3 /tmp/_upsert_env.py; rm -f /tmp/_upsert_env.py"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
@@ -302,17 +306,21 @@ def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # Check for existing webhook (per_page=100 covers most orgs)
+    # Check for existing webhook (per_page=100 covers most orgs).
+    # Raise on non-200 to avoid silently creating duplicates on transient errors.
     resp = requests.get(
         f"{GH_API}/orgs/{org}/hooks",
         headers=headers, params={"per_page": 100}, timeout=30,
     )
-    if resp.status_code == 200:
-        check_pagination(resp, "webhooks")
-        for hook in resp.json():
-            if hook.get("config", {}).get("url") == url:
-                print(f"  Webhook already exists (id={hook['id']}), skipping creation")
-                return
+    if resp.status_code != 200:
+        raise ProvisionError(
+            f"Could not list webhooks ({resp.status_code}): {resp.text}"
+        )
+    check_pagination(resp, "webhooks")
+    for hook in resp.json():
+        if hook.get("config", {}).get("url") == url:
+            print(f"  Webhook already exists (id={hook['id']}), skipping creation")
+            return
 
     print(f"  Creating GitHub webhook for {org} -> {url}")
     resp = requests.post(
@@ -347,6 +355,7 @@ def _auto_cleanup(created: dict, config: dict):
         from destroy import delete_dns_record, delete_server, delete_tunnel, delete_webhook
     except ImportError as e:
         print(f"  Warning: could not import destroy module for cleanup: {e}", file=sys.stderr)
+        print(f"  Resources that may need manual cleanup: {created}", file=sys.stderr)
         return
 
     # Reverse order: webhook -> DNS -> tunnel -> server
@@ -418,7 +427,7 @@ def main():
         webhook_secret = read_webhook_secret(ip)
         create_webhook(config, webhook_secret, hostname)
         created["webhook"] = hostname
-        ssh(ip, "systemctl start pr-review")
+        ssh(ip, "systemctl restart pr-review")
 
         # Summary
         print()
@@ -432,7 +441,7 @@ def main():
         print(f"  Health:   ssh root@{ip} curl -s localhost:8081/health")
         print("=" * 60)
 
-    except (ProvisionError, BuildError) as e:
+    except (ProvisionError, BuildError, APIException) as e:
         print(f"\nERROR: {e}", file=sys.stderr)
         _auto_cleanup(created, config)
         sys.exit(1)
