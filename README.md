@@ -15,7 +15,7 @@ A self-hosted agent that automatically reviews pull requests using your Claude C
 ## Architecture
 
 ```
-GitHub webhook → Cloudflare (TLS) → Caddy (reverse proxy) → Python agent → Claude Code CLI → gh pr comment
+GitHub webhook → Cloudflare Tunnel (TLS) → cloudflared → Caddy (reverse proxy) → Python agent → Claude Code CLI → gh pr comment
 ```
 
 ## Project structure
@@ -25,6 +25,7 @@ agent.py                 # Webhook listener + review logic
 prompt.md                # Review prompt template (customize this!)
 cloud-init.tmpl.yaml     # Cloud-init template with {{FILE:...}} markers
 build.py                 # Assembles cloud-init.yaml from template + source files
+Caddyfile.origin-ca      # Caddy TLS config for custom domain setup
 Justfile                 # Build, test, and deploy commands
 pyproject.toml           # Python project config (dev deps via uv)
 .env.example             # Copy to .env, fill in your values
@@ -33,7 +34,7 @@ pyproject.toml           # Python project config (dev deps via uv)
 ## Prerequisites
 
 - **Hetzner Cloud account** (or any VPS — adjust cloud-init as needed)
-- **Cloudflare account** with your domain's DNS managed there
+- **Cloudflare account** (free tier works — used for tunnel or DNS)
 - **GitHub org** with permission to create org-level webhooks
 - **Claude Code subscription** (Pro or Max) for `claude setup-token`
 - **SSH key** added to your Hetzner account
@@ -69,14 +70,7 @@ just build
 
 This assembles `cloud-init.yaml` from the template and your source files. The built file is gitignored — it's a build artifact.
 
-### 4. Create the Cloudflare Origin CA certificate
-
-1. In Cloudflare dashboard → your domain → **SSL/TLS → Origin Server**
-2. Click **Create Certificate**, set hostname to your subdomain (e.g. `pr-review.yourdomain.com`)
-3. Copy both the certificate and private key (the key is only shown once)
-4. Under **SSL/TLS → Overview**, set encryption mode to **Full (Strict)**
-
-### 5. Create the Hetzner server
+### 4. Create the Hetzner server
 
 1. Go to [Hetzner Cloud Console](https://console.hetzner.cloud/) → **Create Server**
 2. Select Ubuntu 24.04, CX11, your SSH key
@@ -85,28 +79,37 @@ This assembles `cloud-init.yaml` from the template and your source files. The bu
 
 Wait 3–5 minutes for cloud-init to finish (watch the CPU graph in Hetzner console).
 
-### 6. Point your domain at the server
+### 5. Set up a Cloudflare Tunnel
 
-In Cloudflare DNS, add an A record:
+This gives you a public HTTPS URL without opening any inbound ports or managing certificates.
 
-| Type | Name         | Content         | Proxy   |
-|------|--------------|-----------------|---------|
-| A    | `pr-review`  | `<server IPv4>` | Proxied |
-
-### 7. Configure the server
-
-SSH in and complete setup:
+1. In Cloudflare dashboard → **Zero Trust → Networks → Tunnels**
+2. Click **Create a tunnel**, choose **Cloudflared**, name it (e.g. `pr-review`)
+3. Copy the install/run command — it includes your tunnel token
+4. SSH into your server and run the install command:
 
 ```bash
 ssh root@<server-ip>
 
-# Install the Cloudflare Origin CA cert
-nano /etc/caddy/certs/origin.pem      # paste certificate
-nano /etc/caddy/certs/origin-key.pem  # paste private key
-chmod 644 /etc/caddy/certs/origin.pem
-chmod 600 /etc/caddy/certs/origin-key.pem
-chown caddy:caddy /etc/caddy/certs/origin-key.pem
-systemctl restart caddy
+# Add Cloudflare's GPG key and APT repo
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflared.list
+apt-get update && apt-get install -y cloudflared
+
+# Install the tunnel as a service using the token Cloudflare gave you
+cloudflared service install <YOUR_TUNNEL_TOKEN>
+```
+
+5. Back in the Cloudflare dashboard, add a **Public Hostname** for the tunnel:
+   - **Subdomain:** `pr-review` (or whatever you like)
+   - **Domain:** pick any domain on your Cloudflare account, or use the generated `*.cfargotunnel.com` URL
+   - **Service:** `http://localhost:80` (Caddy handles the rest)
+6. Note the resulting public URL (e.g. `https://pr-review.yourdomain.com`)
+
+### 6. Configure the server
+
+```bash
+ssh root@<server-ip>
 
 # Authenticate GitHub CLI
 sudo -u review gh auth login
@@ -117,33 +120,71 @@ sudo -u review claude
 # Start the agent
 systemctl start pr-review
 
-# Verify
+# Verify locally
 curl http://localhost:8080/health
+# → {"status":"healthy"}
+
+# Verify end-to-end through the tunnel
+curl https://<your-tunnel-hostname>/health
 # → {"status":"healthy"}
 ```
 
-### 8. Create the GitHub webhook
+### 7. Create the GitHub webhook
 
 1. GitHub org → **Settings → Webhooks → Add webhook**
-2. **Payload URL:** `https://pr-review.yourdomain.com/webhook`
+2. **Payload URL:** `https://<your-tunnel-hostname>/webhook`
 3. **Content type:** `application/json`
 4. **Secret:** `grep WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2`
 5. **Events:** Pull requests only
 6. Check **Recent Deliveries** for a `200` response
 
-### 9. Test it
+### 8. Test it
 
 Open a PR on any repo in your org. You should see a review comment within 1–2 minutes.
+
+---
+
+## Alternative: Custom domain with Origin CA
+
+If you already have a domain on Cloudflare and prefer to use an Origin CA certificate instead of a tunnel, replace step 5 above with:
+
+### 5a. Create the Cloudflare Origin CA certificate
+
+1. In Cloudflare dashboard → your domain → **SSL/TLS → Origin Server**
+2. Click **Create Certificate**, set hostname to your subdomain (e.g. `pr-review.yourdomain.com`)
+3. Copy both the certificate and private key (the key is only shown once)
+4. Under **SSL/TLS → Overview**, set encryption mode to **Full (Strict)**
+
+### 5b. Point your domain at the server
+
+In Cloudflare DNS, add an A record:
+
+| Type | Name         | Content         | Proxy   |
+|------|--------------|-----------------|---------|
+| A    | `pr-review`  | `<server IPv4>` | Proxied |
+
+### 5c. Configure the server for TLS
+
+Save the certificate and private key from step 5a to local files, then run:
+
+```bash
+just setup-tls root@<server-ip> origin.pem origin-key.pem
+```
+
+This deploys the TLS Caddyfile, installs the certs with correct permissions, opens port 443, and restarts Caddy.
+
+Then continue with step 6 (configure the server) as normal.
 
 ---
 
 ## Commands
 
 ```bash
-just build              # Assemble cloud-init.yaml from template + sources
-just test               # Run tests (via uv)
-just deploy user@host   # SCP source files to server and restart
-just clean              # Remove built cloud-init.yaml
+just build                                    # Assemble cloud-init.yaml from template + sources
+just test                                     # Run tests (via uv)
+just deploy user@host                         # SCP source files to server and restart
+just setup-tls host cert key                  # Configure Origin CA TLS (custom domain only)
+just clean                                    # Remove built cloud-init.yaml
 ```
 
 ## Updating a running server
@@ -186,6 +227,8 @@ Edit `LOW_PRIORITY_PATTERNS` in `agent.py` to control which files get dropped fi
 
 **Caddy won't start** — Check cert permissions: `origin.pem` should be 644, `origin-key.pem` should be 600 owned by `caddy:caddy`.
 
+**Tunnel not connecting** — Check `systemctl status cloudflared` and verify the tunnel is active in the Cloudflare Zero Trust dashboard.
+
 **Reviews aren't posting** — Verify gh access: `sudo -u review gh pr list --repo your-org/some-repo`.
 
 ## Maintenance
@@ -193,6 +236,6 @@ Edit `LOW_PRIORITY_PATTERNS` in `agent.py` to control which files get dropped fi
 | Task | Frequency | How |
 |------|-----------|-----|
 | Renew Claude token | Yearly | `claude setup-token`, update `.env`, restart |
-| Renew Origin CA cert | 15 years | Regenerate in Cloudflare, replace cert files |
+| Renew Origin CA cert | 15 years | Regenerate in Cloudflare, replace cert files (custom domain only) |
 | Update Claude Code | As needed | Bump version in `cloud-init.tmpl.yaml`, `just build` |
 | System packages | Monthly | `apt update && apt upgrade` |

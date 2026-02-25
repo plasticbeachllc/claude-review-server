@@ -6,17 +6,15 @@
 # Edit the source files and run: just build
 #
 # POST-PROVISION STEPS (do these manually after first boot):
-#   1. Place Cloudflare Origin CA cert + key:
-#        /etc/caddy/certs/origin.pem
-#        /etc/caddy/certs/origin-key.pem
-#      Then: sudo systemctl restart caddy
+#   1. Set up a Cloudflare Tunnel pointing to http://localhost:80
+#      (see README for details)
 #
 #   2. Authenticate the review user:
 #        sudo -u review gh auth login          # GitHub OAuth
 #        sudo -u review claude                  # Claude subscription login
 #
 #   3. Configure an org-level webhook in GitHub:
-#        URL:    https://your-domain.com/webhook
+#        URL:    https://<tunnel-hostname>/webhook
 #        Secret: (value from /opt/pr-review/.env)
 #        Events: Pull requests
 #
@@ -107,14 +105,15 @@ runcmd:
   - apt-get update && apt-get install -y caddy
 
   # ── Write Caddy config (after install so it doesn't get overwritten) ──
+  # Default: plain HTTP on :80 for Cloudflare Tunnel (tunnel terminates TLS).
+  # For Origin CA setup, replace this with a :443 TLS block — see README.
   - |
     cat > /etc/caddy/Caddyfile <<'CADDYEOF'
     {
         auto_https off
     }
 
-    :443 {
-        tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin-key.pem
+    :80 {
         reverse_proxy 127.0.0.1:8080
         request_body {
             max_size 5MB
@@ -125,6 +124,7 @@ runcmd:
         }
     }
 
+    # Internal health checks only — not exposed externally (UFW blocks 8081)
     :8081 {
         respond /ping "pong" 200
         reverse_proxy /health 127.0.0.1:8080
@@ -146,13 +146,14 @@ runcmd:
 
   # ── Set up directories and permissions ────────────────────
   - mkdir -p /opt/pr-review/workspace
-  - mkdir -p /etc/caddy/certs
   - chown -R review:review /opt/pr-review
   - chmod 600 /opt/pr-review/.env
 
-  # ── Firewall — only SSH and HTTPS ─────────────────────────
+  # ── Firewall — only SSH ──────────────────────────────────
+  # Port 80 is intentionally NOT opened: Caddy listens on :80 for the tunnel,
+  # but cloudflared connects to it via localhost. No inbound ports needed.
+  # For Origin CA setups, `just setup-tls` opens 443 automatically.
   - ufw allow OpenSSH
-  - ufw allow 443/tcp
   - ufw --force enable
 
   # ── Enable services (don't start pr-review yet — needs auth) ──
@@ -164,10 +165,7 @@ runcmd:
     echo "════════════════════════════════════════════════════════"
     echo "  SETUP COMPLETE — manual steps remaining:"
     echo ""
-    echo "  1. Add Cloudflare Origin CA cert:"
-    echo "       /etc/caddy/certs/origin.pem"
-    echo "       /etc/caddy/certs/origin-key.pem"
-    echo "     Then: systemctl restart caddy"
+    echo "  1. Set up Cloudflare Tunnel (see README)"
     echo ""
     echo "  2. Authenticate:"
     echo "       sudo -u review gh auth login"
@@ -176,6 +174,6 @@ runcmd:
     echo "  3. Start the agent:"
     echo "       systemctl start pr-review"
     echo ""
-    echo "  4. Configure org webhook → https://your-domain/webhook"
+    echo "  4. Configure org webhook → https://<tunnel-hostname>/webhook"
     echo "       Secret: grep WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2"
     echo "════════════════════════════════════════════════════════"
