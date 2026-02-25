@@ -7,7 +7,6 @@ set +a
 
 ALERT_REPO="${ALERT_REPO:-}"
 ISSUE_TITLE="🔑 PR Review Agent: Claude auth expired"
-LOCKFILE="/tmp/pr-review-auth-alert.lock"
 
 check_claude() {
     timeout 30 claude -p "Reply with OK" --output-format text 2>/dev/null \

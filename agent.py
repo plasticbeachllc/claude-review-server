@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -83,7 +84,7 @@ def smart_truncate_diff(diff: str, max_chars: int = 40_000) -> tuple[str, str]:
                 file_diffs.append((current_name, "".join(current)))
             current = [line]
             # Extract filename from "diff --git a/path b/path"
-            parts = line.split()
+            parts = shlex.split(line)
             current_name = parts[-1][2:] if len(parts) >= 4 else "unknown"
         else:
             current.append(line)
@@ -137,25 +138,23 @@ def collapse_old_reviews(repo: str, pr_number: int):
          "--paginate", "--jq",
          '.[] | select(.body | contains("<!-- claude-review -->")) '
          '| select(.body | contains("<details>") | not) '
-         '| .id'],
+         '| {id: .id, body: .body}'],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0 or not result.stdout.strip():
         return
 
-    for comment_id in result.stdout.strip().splitlines():
-        comment_id = comment_id.strip()
-        if not comment_id:
+    for line in result.stdout.strip().splitlines():
+        try:
+            comment = json.loads(line)
+            comment_id = comment.get("id")
+            old_body = comment.get("body")
+        except (json.JSONDecodeError, AttributeError):
             continue
-        # Fetch the comment body
-        body_result = subprocess.run(
-            ["gh", "api", f"/repos/{repo}/issues/comments/{comment_id}",
-             "--jq", ".body"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if body_result.returncode != 0:
+
+        if not comment_id or not old_body:
             continue
-        old_body = body_result.stdout.strip()
+
         # Wrap in collapsed details
         collapsed = (
             f"{REVIEW_MARKER}\n"

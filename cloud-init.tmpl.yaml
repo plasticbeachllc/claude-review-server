@@ -175,15 +175,13 @@ runcmd:
   # ── Generate secrets and write env file ───────────────────
   - |
     WEBHOOK_SECRET=$(openssl rand -hex 32)
-    cat > /opt/pr-review/.env <<'ENVEOF'
-    GITHUB_WEBHOOK_SECRET=__PLACEHOLDER__
-    REVIEW_WORKDIR=/opt/pr-review/workspace
-    MAX_WORKERS=4
-    PORT=8080
-    ALERT_REPO=
-    ENVEOF
-    sed -i "s|__PLACEHOLDER__|${WEBHOOK_SECRET}|" /opt/pr-review/.env
-    sed -i 's/^[[:space:]]*//' /opt/pr-review/.env
+    {
+      echo "GITHUB_WEBHOOK_SECRET=${WEBHOOK_SECRET}"
+      echo "REVIEW_WORKDIR=/opt/pr-review/workspace"
+      echo "MAX_WORKERS=4"
+      echo "PORT=8080"
+      echo "ALERT_REPO="
+    } > /opt/pr-review/.env
 
   # ── Set up directories and permissions ────────────────────
   - mkdir -p /opt/pr-review/workspace

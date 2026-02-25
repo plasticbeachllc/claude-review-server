@@ -56,6 +56,7 @@ write_files:
       import logging
       import os
       import re
+      import shlex
       import subprocess
       import sys
       from concurrent.futures import ThreadPoolExecutor
@@ -132,7 +133,7 @@ write_files:
                       file_diffs.append((current_name, "".join(current)))
                   current = [line]
                   # Extract filename from "diff --git a/path b/path"
-                  parts = line.split()
+                  parts = shlex.split(line)
                   current_name = parts[-1][2:] if len(parts) >= 4 else "unknown"
               else:
                   current.append(line)
@@ -186,25 +187,23 @@ write_files:
                "--paginate", "--jq",
                '.[] | select(.body | contains("<!-- claude-review -->")) '
                '| select(.body | contains("<details>") | not) '
-               '| .id'],
+               '| {id: .id, body: .body}'],
               capture_output=True, text=True, timeout=30,
           )
           if result.returncode != 0 or not result.stdout.strip():
               return
 
-          for comment_id in result.stdout.strip().splitlines():
-              comment_id = comment_id.strip()
-              if not comment_id:
+          for line in result.stdout.strip().splitlines():
+              try:
+                  comment = json.loads(line)
+                  comment_id = comment.get("id")
+                  old_body = comment.get("body")
+              except (json.JSONDecodeError, AttributeError):
                   continue
-              # Fetch the comment body
-              body_result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/issues/comments/{comment_id}",
-                   "--jq", ".body"],
-                  capture_output=True, text=True, timeout=30,
-              )
-              if body_result.returncode != 0:
+
+              if not comment_id or not old_body:
                   continue
-              old_body = body_result.stdout.strip()
+
               # Wrap in collapsed details
               collapsed = (
                   f"{REVIEW_MARKER}\n"
@@ -412,7 +411,6 @@ write_files:
 
       ALERT_REPO="${ALERT_REPO:-}"
       ISSUE_TITLE="🔑 PR Review Agent: Claude auth expired"
-      LOCKFILE="/tmp/pr-review-auth-alert.lock"
 
       check_claude() {
           timeout 30 claude -p "Reply with OK" --output-format text 2>/dev/null \
@@ -600,15 +598,13 @@ runcmd:
   # ── Generate secrets and write env file ───────────────────
   - |
     WEBHOOK_SECRET=$(openssl rand -hex 32)
-    cat > /opt/pr-review/.env <<'ENVEOF'
-    GITHUB_WEBHOOK_SECRET=__PLACEHOLDER__
-    REVIEW_WORKDIR=/opt/pr-review/workspace
-    MAX_WORKERS=4
-    PORT=8080
-    ALERT_REPO=
-    ENVEOF
-    sed -i "s|__PLACEHOLDER__|${WEBHOOK_SECRET}|" /opt/pr-review/.env
-    sed -i 's/^[[:space:]]*//' /opt/pr-review/.env
+    {
+      echo "GITHUB_WEBHOOK_SECRET=${WEBHOOK_SECRET}"
+      echo "REVIEW_WORKDIR=/opt/pr-review/workspace"
+      echo "MAX_WORKERS=4"
+      echo "PORT=8080"
+      echo "ALERT_REPO="
+    } > /opt/pr-review/.env
 
   # ── Set up directories and permissions ────────────────────
   - mkdir -p /opt/pr-review/workspace
