@@ -22,6 +22,7 @@ class BuildError(Exception):
 
 
 def build(root: Path) -> str:
+    root = root.resolve()
     template = (root / TEMPLATE).read_text()
     lines = template.splitlines(keepends=True)
     out = []
