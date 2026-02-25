@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 import requests
-from hcloud import Client
+from hcloud import APIException, Client
 from hcloud.images import Image
 from hcloud.locations import Location
 from hcloud.server_types import ServerType
@@ -30,77 +30,17 @@ from hcloud.ssh_keys import SSHKey
 # Reuse the existing build system
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import CF_API, GH_API, ProvisionError, cf_request, load_config  # noqa: E402
 from build import BuildError, build  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CF_API = "https://api.cloudflare.com/client/v4"
-GH_API = "https://api.github.com"
-
-REQUIRED_KEYS = [
-    "HCLOUD_TOKEN",
-    "GH_TOKEN",
-    "CLAUDE_CODE_AUTH_TOKEN",
-    "CF_API_TOKEN",
-    "CF_ACCOUNT_ID",
-    "CF_ZONE_ID",
-    "TUNNEL_HOSTNAME",
-    "GITHUB_ORG",
-]
-DEFAULTS = {
-    "SERVER_NAME": "pr-review",
-    "SERVER_TYPE": "cx22",
-    "SERVER_LOCATION": "fsn1",
-}
-
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=10",
     "-o", "BatchMode=yes",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-class ProvisionError(Exception):
-    """Raised when a provisioning step fails."""
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-def load_config(root: Path) -> dict:
-    """Load .env file and validate required keys."""
-    env_path = root / ".env"
-    if not env_path.exists():
-        raise ProvisionError(f".env not found at {env_path} — cp .env.example .env")
-
-    config = {}
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip()
-        # Strip surrounding quotes (single or double) — common .env convention
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        config[key.strip()] = value
-
-    # Apply defaults
-    for key, default in DEFAULTS.items():
-        config.setdefault(key, default)
-
-    # Validate
-    missing = [k for k in REQUIRED_KEYS if not config.get(k)]
-    if missing:
-        raise ProvisionError(f"Missing required .env keys: {', '.join(missing)}")
-
-    return config
 
 
 # ---------------------------------------------------------------------------
@@ -184,16 +124,13 @@ def find_local_pubkey() -> tuple[str, str]:
 
 def ensure_ssh_key(client: Client, pubkey_content: str) -> SSHKey:
     """Find or create the SSH key on Hetzner (matched by fingerprint)."""
-    # hcloud deduplicates by fingerprint — try creating, catch conflict
     name = "pr-review"
     try:
         key = client.ssh_keys.create(name=name, public_key=pubkey_content)
         print(f"  Created SSH key '{name}' on Hetzner")
         return key
-    except Exception as e:
-        err = str(e)
-        # Key with this fingerprint already exists — find it
-        if "uniqueness_error" in err or "already" in err.lower():
+    except APIException as e:
+        if e.code == "uniqueness_error":
             for key in client.ssh_keys.get_all():
                 if key.public_key.strip() == pubkey_content.strip():
                     print(f"  Reusing SSH key '{key.name}' on Hetzner")
@@ -204,9 +141,7 @@ def ensure_ssh_key(client: Client, pubkey_content: str) -> SSHKey:
 # ---------------------------------------------------------------------------
 # Hetzner server
 # ---------------------------------------------------------------------------
-def create_server(
-    client: Client, config: dict, ssh_key: SSHKey, cloud_init: str,
-) -> "hcloud.servers.domain.Server":
+def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str):
     """Create a Hetzner server with cloud-init user data."""
     name = config["SERVER_NAME"]
 
@@ -247,13 +182,12 @@ def create_server(
 # ---------------------------------------------------------------------------
 def inject_auth(ip: str, config: dict):
     """Inject GitHub and Claude auth tokens into the server."""
-    # GitHub CLI auth
+    # GitHub CLI auth — pipe token via stdin to avoid exposing it in process args
     print("  Authenticating GitHub CLI...")
-    gh_token = shlex.quote(config["GH_TOKEN"])
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
-         f"echo {gh_token} | sudo -u review gh auth login --with-token"],
-        capture_output=True, text=True, timeout=30,
+         "sudo -u review gh auth login --with-token"],
+        input=config["GH_TOKEN"], capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
         raise ProvisionError(
@@ -271,37 +205,36 @@ def inject_auth(ip: str, config: dict):
 # ---------------------------------------------------------------------------
 # Cloudflare Tunnel
 # ---------------------------------------------------------------------------
-def cf_request(method: str, path: str, token: str, **kwargs) -> dict:
-    """Make an authenticated Cloudflare API request."""
-    resp = requests.request(
-        method, f"{CF_API}{path}",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        timeout=30, **kwargs,
-    )
-    data = resp.json()
-    if not data.get("success"):
-        errors = data.get("errors", [])
-        raise ProvisionError(f"Cloudflare API error: {errors}")
-    return data
-
-
 def setup_tunnel(config: dict, server_ip: str) -> str:
-    """Create a Cloudflare Tunnel, configure DNS, and install on the server."""
+    """Create a Cloudflare Tunnel, configure DNS, and install on the server.
+
+    If a tunnel with the same name already exists, reuses it instead of
+    creating a duplicate.
+    """
     token = config["CF_API_TOKEN"]
     account = config["CF_ACCOUNT_ID"]
     zone = config["CF_ZONE_ID"]
     hostname = config["TUNNEL_HOSTNAME"]
     tunnel_name = config.get("SERVER_NAME", "pr-review")
 
-    # 1. Create tunnel
-    print(f"  Creating Cloudflare Tunnel '{tunnel_name}'...")
-    tunnel_secret = base64.b64encode(secrets.token_bytes(32)).decode()
-    data = cf_request(
-        "POST", f"/accounts/{account}/cfd_tunnel",
-        token, json={"name": tunnel_name, "tunnel_secret": tunnel_secret},
+    # 1. Create tunnel (or reuse existing)
+    existing = cf_request(
+        "GET", f"/accounts/{account}/cfd_tunnel",
+        token, params={"name": tunnel_name, "is_deleted": "false"},
     )
-    tunnel_id = data["result"]["id"]
-    print(f"  Tunnel created: {tunnel_id}")
+    existing_tunnels = existing.get("result", [])
+    if existing_tunnels:
+        tunnel_id = existing_tunnels[0]["id"]
+        print(f"  Reusing existing Cloudflare Tunnel '{tunnel_name}' ({tunnel_id})")
+    else:
+        print(f"  Creating Cloudflare Tunnel '{tunnel_name}'...")
+        tunnel_secret = base64.b64encode(secrets.token_bytes(32)).decode()
+        data = cf_request(
+            "POST", f"/accounts/{account}/cfd_tunnel",
+            token, json={"name": tunnel_name, "tunnel_secret": tunnel_secret},
+        )
+        tunnel_id = data["result"]["id"]
+        print(f"  Tunnel created: {tunnel_id}")
 
     # 2. Configure ingress
     print("  Configuring tunnel ingress...")
@@ -317,17 +250,34 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
         },
     )
 
-    # 3. Create DNS CNAME
+    # 3. Create DNS CNAME (skip if it already exists)
     print(f"  Creating DNS record {hostname} -> tunnel...")
-    cf_request(
-        "POST", f"/zones/{zone}/dns_records",
-        token, json={
-            "type": "CNAME",
-            "name": hostname,
-            "content": f"{tunnel_id}.cfargotunnel.com",
-            "proxied": True,
-        },
+    existing_dns = cf_request(
+        "GET", f"/zones/{zone}/dns_records",
+        token, params={"name": hostname, "type": "CNAME"},
     )
+    if existing_dns.get("result"):
+        record = existing_dns["result"][0]
+        print(f"  DNS record already exists (id={record['id']}), updating...")
+        cf_request(
+            "PUT", f"/zones/{zone}/dns_records/{record['id']}",
+            token, json={
+                "type": "CNAME",
+                "name": hostname,
+                "content": f"{tunnel_id}.cfargotunnel.com",
+                "proxied": True,
+            },
+        )
+    else:
+        cf_request(
+            "POST", f"/zones/{zone}/dns_records",
+            token, json={
+                "type": "CNAME",
+                "name": hostname,
+                "content": f"{tunnel_id}.cfargotunnel.com",
+                "proxied": True,
+            },
+        )
 
     # 4. Get connector token
     print("  Getting tunnel connector token...")
@@ -347,25 +297,40 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
 # ---------------------------------------------------------------------------
 def read_webhook_secret(ip: str) -> str:
     """Read the auto-generated GITHUB_WEBHOOK_SECRET from the server."""
-    raw = ssh(ip, "grep ^GITHUB_WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2")
+    raw = ssh(ip, "grep ^GITHUB_WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2-")
     if not raw:
         raise ProvisionError("Could not read GITHUB_WEBHOOK_SECRET from server")
     return raw
 
 
 def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
-    """Create a GitHub org-level webhook."""
+    """Create a GitHub org-level webhook.
+
+    If a webhook with the same URL already exists, skips creation.
+    """
     org = config["GITHUB_ORG"]
     url = f"https://{tunnel_hostname}/webhook"
-    print(f"  Creating GitHub webhook for {org} -> {url}")
+    headers = {
+        "Authorization": f"Bearer {config['GH_TOKEN']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
+    # Check for existing webhook with the same URL
+    resp = requests.get(
+        f"{GH_API}/orgs/{org}/hooks",
+        headers=headers, params={"per_page": 100}, timeout=30,
+    )
+    if resp.status_code == 200:
+        for hook in resp.json():
+            if hook.get("config", {}).get("url") == url:
+                print(f"  Webhook already exists (id={hook['id']}), skipping creation")
+                return
+
+    print(f"  Creating GitHub webhook for {org} -> {url}")
     resp = requests.post(
         f"{GH_API}/orgs/{org}/hooks",
-        headers={
-            "Authorization": f"Bearer {config['GH_TOKEN']}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=headers,
         json={
             "name": "web",
             "config": {

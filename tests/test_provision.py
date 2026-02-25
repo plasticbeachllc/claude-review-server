@@ -31,7 +31,7 @@ class TestLoadConfig:
         return "\n".join(f"{k}={v}" for k, v in defaults.items())
 
     def test_loads_valid_config(self, tmp_path):
-        from provision import load_config
+        from _common import load_config
 
         root = self._write_env(tmp_path, self._full_env())
         config = load_config(root)
@@ -39,7 +39,7 @@ class TestLoadConfig:
         assert config["GITHUB_ORG"] == "myorg"
 
     def test_applies_defaults(self, tmp_path):
-        from provision import load_config
+        from _common import load_config
 
         root = self._write_env(tmp_path, self._full_env())
         config = load_config(root)
@@ -48,7 +48,7 @@ class TestLoadConfig:
         assert config["SERVER_LOCATION"] == "fsn1"
 
     def test_overrides_defaults(self, tmp_path):
-        from provision import load_config
+        from _common import load_config
 
         env = self._full_env() + "\nSERVER_TYPE=cx32\nSERVER_LOCATION=hel1"
         root = self._write_env(tmp_path, env)
@@ -57,7 +57,7 @@ class TestLoadConfig:
         assert config["SERVER_LOCATION"] == "hel1"
 
     def test_missing_required_key_raises(self, tmp_path):
-        from provision import ProvisionError, load_config
+        from _common import ProvisionError, load_config
 
         # Missing HCLOUD_TOKEN
         env = self._full_env(HCLOUD_TOKEN="")
@@ -66,7 +66,7 @@ class TestLoadConfig:
             load_config(root)
 
     def test_multiple_missing_keys(self, tmp_path):
-        from provision import ProvisionError, load_config
+        from _common import ProvisionError, load_config
 
         root = self._write_env(tmp_path, "SERVER_NAME=test\n")
         with pytest.raises(ProvisionError) as exc:
@@ -76,13 +76,13 @@ class TestLoadConfig:
         assert "GH_TOKEN" in msg
 
     def test_missing_env_file_raises(self, tmp_path):
-        from provision import ProvisionError, load_config
+        from _common import ProvisionError, load_config
 
         with pytest.raises(ProvisionError, match=".env not found"):
             load_config(tmp_path)
 
     def test_ignores_comments_and_blanks(self, tmp_path):
-        from provision import load_config
+        from _common import load_config
 
         env = "# This is a comment\n\n" + self._full_env()
         root = self._write_env(tmp_path, env)
@@ -90,7 +90,7 @@ class TestLoadConfig:
         assert config["HCLOUD_TOKEN"] == "hc-test-token"
 
     def test_strips_surrounding_quotes(self, tmp_path):
-        from provision import load_config
+        from _common import load_config
 
         env = self._full_env(
             HCLOUD_TOKEN='"hc-quoted-double"',
@@ -102,7 +102,7 @@ class TestLoadConfig:
         assert config["GH_TOKEN"] == "ghp-quoted-single"
 
     def test_preserves_value_with_equals(self, tmp_path):
-        from provision import load_config
+        from _common import load_config
 
         env = self._full_env(CF_API_TOKEN="abc=def=ghi")
         root = self._write_env(tmp_path, env)
@@ -139,7 +139,8 @@ class TestFindLocalPubkey:
         assert name == "id_rsa"
 
     def test_raises_when_no_key(self, tmp_path):
-        from provision import ProvisionError, find_local_pubkey
+        from _common import ProvisionError
+        from provision import find_local_pubkey
 
         with patch("provision.Path.home", return_value=tmp_path):
             with pytest.raises(ProvisionError, match="No SSH public key"):
@@ -151,9 +152,9 @@ class TestFindLocalPubkey:
 
 @pytest.mark.usefixtures("scripts_on_path")
 class TestCfRequest:
-    @patch("provision.requests.request")
+    @patch("_common.requests.request")
     def test_sends_auth_header(self, mock_request):
-        from provision import cf_request
+        from _common import cf_request
 
         mock_request.return_value = MagicMock(
             json=lambda: {"success": True, "result": {}},
@@ -163,9 +164,9 @@ class TestCfRequest:
         call_kwargs = mock_request.call_args
         assert call_kwargs[1]["headers"]["Authorization"] == "Bearer my-cf-token"
 
-    @patch("provision.requests.request")
+    @patch("_common.requests.request")
     def test_raises_on_api_error(self, mock_request):
-        from provision import ProvisionError, cf_request
+        from _common import ProvisionError, cf_request
 
         mock_request.return_value = MagicMock(
             json=lambda: {
@@ -182,10 +183,16 @@ class TestCfRequest:
 
 @pytest.mark.usefixtures("scripts_on_path")
 class TestCreateWebhook:
+    @patch("provision.requests.get")
     @patch("provision.requests.post")
-    def test_posts_correct_payload(self, mock_post):
+    def test_posts_correct_payload(self, mock_post, mock_get):
         from provision import create_webhook
 
+        # No existing webhooks
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [],
+        )
         mock_post.return_value = MagicMock(
             status_code=201,
             json=lambda: {"id": 42},
@@ -201,10 +208,16 @@ class TestCreateWebhook:
         assert payload["events"] == ["pull_request"]
         assert payload["active"] is True
 
+    @patch("provision.requests.get")
     @patch("provision.requests.post")
-    def test_raises_on_failure(self, mock_post):
-        from provision import ProvisionError, create_webhook
+    def test_raises_on_failure(self, mock_post, mock_get):
+        from _common import ProvisionError
+        from provision import create_webhook
 
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [],
+        )
         mock_post.return_value = MagicMock(
             status_code=422,
             text="Validation failed",
@@ -213,6 +226,23 @@ class TestCreateWebhook:
         config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
         with pytest.raises(ProvisionError, match="422"):
             create_webhook(config, "secret", "host.example.com")
+
+    @patch("provision.requests.get")
+    @patch("provision.requests.post")
+    def test_skips_when_webhook_exists(self, mock_post, mock_get):
+        from provision import create_webhook
+
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [
+                {"id": 99, "config": {"url": "https://pr-review.example.com/webhook"}},
+            ],
+        )
+
+        config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
+        create_webhook(config, "secret123", "pr-review.example.com")
+
+        mock_post.assert_not_called()
 
 
 # ── Destroy script ─────────────────────────────────────────
@@ -257,3 +287,23 @@ class TestDestroy:
         delete_server(config)
 
         mock_client.servers.delete.assert_called_once_with(mock_server)
+
+    @patch("destroy.requests.get")
+    def test_delete_webhook_uses_pagination(self, mock_get):
+        from destroy import delete_webhook
+
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [],
+        )
+
+        config = {
+            "GITHUB_ORG": "myorg",
+            "GH_TOKEN": "ghp_test",
+            "TUNNEL_HOSTNAME": "pr-review.example.com",
+        }
+        delete_webhook(config)
+
+        # Verify per_page=100 is sent
+        call_kwargs = mock_get.call_args
+        assert call_kwargs[1]["params"]["per_page"] == 100

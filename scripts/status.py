@@ -15,7 +15,8 @@ from pathlib import Path
 from hcloud import Client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from provision import ProvisionError, load_config, ssh  # noqa: E402
+from _common import ProvisionError, load_config  # noqa: E402
+from provision import ssh  # noqa: E402
 
 
 def main():
@@ -32,8 +33,8 @@ def main():
     server = client.servers.get_by_name(name)
 
     if not server:
-        print(f"Server '{name}' not found on Hetzner.")
-        sys.exit(1)
+        print(f"Server '{name}' not found on Hetzner (not provisioned).")
+        return
 
     ip = server.public_net.ipv4.ip
     print(f"Server:   {name} (id={server.id})")

@@ -17,7 +17,7 @@ import requests
 from hcloud import Client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from provision import CF_API, GH_API, ProvisionError, cf_request, load_config  # noqa: E402
+from _common import GH_API, ProvisionError, cf_request, load_config  # noqa: E402
 
 
 def delete_webhook(config: dict):
@@ -31,8 +31,11 @@ def delete_webhook(config: dict):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # List hooks and find ours
-    resp = requests.get(f"{GH_API}/orgs/{org}/hooks", headers=headers, timeout=30)
+    # List hooks (per_page=100 to reduce pagination risk)
+    resp = requests.get(
+        f"{GH_API}/orgs/{org}/hooks",
+        headers=headers, params={"per_page": 100}, timeout=30,
+    )
     if resp.status_code != 200:
         print(f"  Warning: could not list webhooks ({resp.status_code})")
         return
