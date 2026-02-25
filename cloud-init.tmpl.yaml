@@ -15,18 +15,13 @@
 #        sudo -u review gh auth login          # GitHub OAuth
 #        sudo -u review claude                  # Claude subscription login
 #
-#   3. Edit /opt/pr-review/.env and set:
-#        ALERT_REPO=your-org/your-repo          # for auth-expiry alerts
-#        GITHUB_WEBHOOK_SECRET=<from GitHub>     # or keep the generated one
-#
-#   4. Configure an org-level webhook in GitHub:
+#   3. Configure an org-level webhook in GitHub:
 #        URL:    https://your-domain.com/webhook
 #        Secret: (value from /opt/pr-review/.env)
 #        Events: Pull requests
 #
-#   5. Start the service:
+#   4. Start the service:
 #        sudo systemctl start pr-review
-#        sudo systemctl start pr-review-auth-check.timer
 # ─────────────────────────────────────────────────────────────────
 
 package_update: true
@@ -54,12 +49,6 @@ write_files:
     permissions: "0644"
     content: |
       {{FILE:prompt.md}}
-
-  # ── Auth health check script ──────────────────────────────
-  - path: /opt/pr-review/check-auth.sh
-    permissions: "0755"
-    content: |
-      {{FILE:check-auth.sh}}
 
   # ── Systemd service ───────────────────────────────────────
   - path: /etc/systemd/system/pr-review.service
@@ -95,33 +84,6 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
-
-  # ── Auth check timer (every 30 min) ──────────────────────
-  - path: /etc/systemd/system/pr-review-auth-check.service
-    content: |
-      [Unit]
-      Description=PR Review Agent auth health check
-
-      [Service]
-      Type=oneshot
-      User=review
-      Group=review
-      EnvironmentFile=/opt/pr-review/.env
-      Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/review/.npm-global/bin
-      ExecStart=/opt/pr-review/check-auth.sh
-
-  - path: /etc/systemd/system/pr-review-auth-check.timer
-    content: |
-      [Unit]
-      Description=Run PR Review auth check every 30 minutes
-
-      [Timer]
-      OnBootSec=5min
-      OnUnitActiveSec=30min
-      RandomizedDelaySec=60
-
-      [Install]
-      WantedBy=timers.target
 
   # ── Caddy reverse proxy config (written in runcmd after caddy install) ──
 
@@ -180,7 +142,6 @@ runcmd:
       echo "REVIEW_WORKDIR=/opt/pr-review/workspace"
       echo "MAX_WORKERS=4"
       echo "PORT=8080"
-      echo "ALERT_REPO="
     } > /opt/pr-review/.env
 
   # ── Set up directories and permissions ────────────────────
@@ -198,7 +159,6 @@ runcmd:
   - systemctl daemon-reload
   - systemctl enable caddy
   - systemctl enable pr-review
-  - systemctl enable pr-review-auth-check.timer
   - |
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -213,13 +173,9 @@ runcmd:
     echo "       sudo -u review gh auth login"
     echo "       sudo -u review claude"
     echo ""
-    echo "  3. Edit /opt/pr-review/.env:"
-    echo "       Set ALERT_REPO=your-org/repo-name"
-    echo ""
-    echo "  4. Start the agent:"
+    echo "  3. Start the agent:"
     echo "       systemctl start pr-review"
-    echo "       systemctl start pr-review-auth-check.timer"
     echo ""
-    echo "  5. Configure org webhook → https://your-domain/webhook"
+    echo "  4. Configure org webhook → https://your-domain/webhook"
     echo "       Secret: $(cat /opt/pr-review/.env | grep WEBHOOK_SECRET | cut -d= -f2)"
     echo "════════════════════════════════════════════════════════"

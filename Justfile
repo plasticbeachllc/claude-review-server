@@ -16,8 +16,8 @@ validate: build
 
 # Deploy agent files to a running server (requires SSH access)
 deploy host:
-    scp agent.py prompt.md check-auth.sh {{host}}:/opt/pr-review/
-    ssh {{host}} 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md /opt/pr-review/check-auth.sh && systemctl restart pr-review'
+    scp agent.py prompt.md {{host}}:/opt/pr-review/
+    ssh {{host}} 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md && systemctl restart pr-review'
     @echo "✓ Deployed and restarted on {{host}}"
 
 # Check that cloud-init.yaml is up to date (for CI)

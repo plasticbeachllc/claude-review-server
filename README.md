@@ -23,7 +23,6 @@ GitHub webhook → Cloudflare (TLS) → Caddy (reverse proxy) → Python agent �
 ```
 agent.py                 # Webhook listener + review logic
 prompt.md                # Review prompt template (customize this!)
-check-auth.sh            # Auth health check (runs every 30 min via systemd)
 cloud-init.tmpl.yaml     # Cloud-init template with {{FILE:...}} markers
 build.py                 # Assembles cloud-init.yaml from template + source files
 Justfile                 # Build, test, and deploy commands
@@ -115,13 +114,8 @@ sudo -u review gh auth login
 # Add Claude Code token (generate with: claude setup-token)
 sudo -u review claude
 
-# Set your alert repo in .env
-nano /opt/pr-review/.env
-# Set ALERT_REPO=your-org/your-repo
-
 # Start the agent
 systemctl start pr-review
-systemctl start pr-review-auth-check.timer
 
 # Verify
 curl http://localhost:8080/health
@@ -154,7 +148,7 @@ just clean              # Remove built cloud-init.yaml
 
 ## Updating a running server
 
-After editing `agent.py`, `prompt.md`, or `check-auth.sh`:
+After editing `agent.py` or `prompt.md`:
 
 ```bash
 just deploy root@<server-ip>

@@ -175,7 +175,6 @@ class TestBuild:
         assert output.startswith("#cloud-config")
         assert "{{FILE:" not in output
         assert "agent.py" in output
-        assert "check-auth.sh" in output
         assert "prompt.md" in output
 
     def test_build_raises_on_missing_file(self, tmp_path):
