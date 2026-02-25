@@ -177,5 +177,5 @@ runcmd:
     echo "       systemctl start pr-review"
     echo ""
     echo "  4. Configure org webhook → https://your-domain/webhook"
-    echo "       Secret: $(cat /opt/pr-review/.env | grep WEBHOOK_SECRET | cut -d= -f2)"
+    echo "       Secret: grep WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2"
     echo "════════════════════════════════════════════════════════"

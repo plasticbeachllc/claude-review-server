@@ -111,7 +111,7 @@ systemctl restart caddy
 # Authenticate GitHub CLI
 sudo -u review gh auth login
 
-# Add Claude Code token (generate with: claude setup-token)
+# Authenticate Claude Code (token is stored in ~review/.claude/)
 sudo -u review claude
 
 # Start the agent
@@ -182,7 +182,7 @@ Edit `LOW_PRIORITY_PATTERNS` in `agent.py` to control which files get dropped fi
 
 **Agent won't start** — Check `journalctl -u pr-review --no-pager -n 30`. Common cause: missing `GITHUB_WEBHOOK_SECRET` in `.env`.
 
-**Claude auth errors** — Regenerate with `claude setup-token`, update `.env`, `systemctl restart pr-review`.
+**Claude auth errors** — Re-run `sudo -u review claude` to re-authenticate (token is stored in `~review/.claude/`), then `systemctl restart pr-review`.
 
 **Caddy won't start** — Check cert permissions: `origin.pem` should be 644, `origin-key.pem` should be 600 owned by `caddy:caddy`.
 
