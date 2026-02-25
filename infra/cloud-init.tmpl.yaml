@@ -149,6 +149,13 @@ runcmd:
   - chown -R review:review /opt/pr-review
   - chmod 600 /opt/pr-review/.env
 
+  # ── Install cloudflared ──────────────────────────────────
+  # Pre-installed for both automated (`just provision`) and manual tunnel setup.
+  # To activate: cloudflared service install <TUNNEL_TOKEN>
+  - curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+  - dpkg -i /tmp/cloudflared.deb
+  - rm /tmp/cloudflared.deb
+
   # ── Firewall — only SSH ──────────────────────────────────
   # Port 80 is intentionally NOT opened: Caddy listens on :80 for the tunnel,
   # but cloudflared connects to it via localhost. No inbound ports needed.
