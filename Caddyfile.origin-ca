@@ -1,0 +1,25 @@
+# Caddy config for Cloudflare Origin CA (custom domain setup).
+#
+# Used by: just setup-tls root@server origin.pem origin-key.pem
+# See README → "Alternative: Custom domain with Origin CA"
+
+{
+    auto_https off
+}
+
+:443 {
+    tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin-key.pem
+    reverse_proxy 127.0.0.1:8080
+    request_body {
+        max_size 5MB
+    }
+    log {
+        output stdout
+        format json
+    }
+}
+
+:8081 {
+    respond /ping "pong" 200
+    reverse_proxy /health 127.0.0.1:8080
+}
