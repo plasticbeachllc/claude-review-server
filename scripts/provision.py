@@ -12,7 +12,6 @@ Usage:
 
 import base64
 import secrets
-import shlex
 import subprocess
 import sys
 import time
@@ -139,13 +138,17 @@ def inject_auth(ip: str, config: dict):
         )
 
     # Claude Code auth — upsert token in the service env file.
-    # Pipe via stdin (like GH_TOKEN above) to avoid leaking into process args.
+    # Pipe via stdin to avoid leaking into process args.  Uses a Python
+    # one-liner on the remote to avoid shell quoting / sed delimiter issues
+    # with arbitrary token values.
     print("  Injecting Claude Code auth token...")
     upsert_cmd = (
-        "read -r TOKEN && "
-        "grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env "
-        "&& sed -i \"s|^CLAUDE_CODE_AUTH_TOKEN=.*|CLAUDE_CODE_AUTH_TOKEN=${TOKEN}|\" /opt/pr-review/.env "
-        "|| echo \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"
+        'python3 -c "'
+        "import sys; t=sys.stdin.read().strip(); p='/opt/pr-review/.env'; "
+        "ls=open(p).readlines(); k='CLAUDE_CODE_AUTH_TOKEN='; "
+        "ns=[k+t+'\\n' if l.startswith(k) else l for l in ls]; "
+        "ns.append(k+t+'\\n') if not any(l.startswith(k) for l in ls) else None; "
+        'open(p,\'w\').writelines(ns)"'
     )
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}", upsert_cmd],
@@ -241,10 +244,18 @@ def setup_tunnel(config: dict, server_ip: str) -> str:
     data = cf_request("GET", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/token", token)
     connector_token = data["result"]
 
-    # 5. Install and start cloudflared on the server
+    # 5. Install and start cloudflared on the server (pipe token via stdin)
     print("  Installing cloudflared tunnel on server...")
-    ssh(server_ip, f"cloudflared service install {shlex.quote(connector_token)}",
-        timeout=60, label="cloudflared service install <TOKEN>")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"root@{server_ip}",
+         "cloudflared service install $(cat)"],
+        input=connector_token, capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise ProvisionError(
+            f"cloudflared install failed (rc={result.returncode})\n"
+            f"stderr: {result.stderr.strip()}"
+        )
 
     return hostname
 
@@ -306,6 +317,33 @@ def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
         )
     hook_id = resp.json().get("id")
     print(f"  Webhook created: id={hook_id}")
+
+
+def _auto_cleanup(created: dict, config: dict):
+    """Best-effort cleanup of partially created resources on failure."""
+    if not created:
+        return
+    print("\nCleaning up partially created resources...", file=sys.stderr)
+    from destroy import delete_dns_record, delete_server, delete_tunnel, delete_webhook
+
+    # Reverse order: webhook -> DNS -> tunnel -> server
+    cleanup_steps = []
+    if "webhook" in created:
+        cleanup_steps.append(("webhook", delete_webhook))
+    if "tunnel" in created:
+        cleanup_steps.extend([
+            ("DNS record", delete_dns_record),
+            ("tunnel", delete_tunnel),
+        ])
+    if "server" in created:
+        cleanup_steps.append(("server", delete_server))
+
+    for label, fn in cleanup_steps:
+        try:
+            fn(config)
+            print(f"  Cleaned up {label}", file=sys.stderr)
+        except Exception as e:
+            print(f"  Warning: failed to clean up {label}: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -372,17 +410,11 @@ def main():
 
     except (ProvisionError, BuildError) as e:
         print(f"\nERROR: {e}", file=sys.stderr)
-        if created:
-            print("\nPartially created resources:", file=sys.stderr)
-            for kind, name in created.items():
-                print(f"  {kind}: {name}", file=sys.stderr)
-            print("Run `just destroy` to clean up.", file=sys.stderr)
+        _auto_cleanup(created, config)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        if created:
-            print(f"Partial resources created: {created}", file=sys.stderr)
-            print("Run `just destroy` to clean up.", file=sys.stderr)
+        _auto_cleanup(created, config)
         sys.exit(1)
 
 

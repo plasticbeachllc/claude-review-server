@@ -139,8 +139,16 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
                 print(" done")
                 return
             if status == "error":
-                detail = data.get("detail", "unknown")
-                raise CloudInitError(f"cloud-init failed: {detail}")
+                detail = data.get("extended_status", data.get("status", "unknown"))
+                # Fetch verbose output for debugging
+                try:
+                    long_out = ssh(ip, "cloud-init status --long 2>/dev/null || true", timeout=10)
+                except Exception:
+                    long_out = ""
+                msg = f"cloud-init failed: {detail}"
+                if long_out:
+                    msg += f"\n{long_out}"
+                raise CloudInitError(msg)
         except CloudInitError:
             raise  # cloud-init errors must propagate immediately
         except (ProvisionError, subprocess.TimeoutExpired, json.JSONDecodeError):
