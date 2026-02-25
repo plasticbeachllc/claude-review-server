@@ -91,9 +91,12 @@ This gives you a public HTTPS URL without opening any inbound ports or managing 
 ```bash
 ssh root@<server-ip>
 
-# Run the command Cloudflare gave you, e.g.:
-curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-dpkg -i cloudflared.deb
+# Add Cloudflare's GPG key and APT repo
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflared.list
+apt-get update && apt-get install -y cloudflared
+
+# Install the tunnel as a service using the token Cloudflare gave you
 cloudflared service install <YOUR_TUNNEL_TOKEN>
 ```
 
@@ -117,8 +120,12 @@ sudo -u review claude
 # Start the agent
 systemctl start pr-review
 
-# Verify
+# Verify locally
 curl http://localhost:8080/health
+# → {"status":"healthy"}
+
+# Verify end-to-end through the tunnel
+curl https://<your-tunnel-hostname>/health
 # → {"status":"healthy"}
 ```
 
