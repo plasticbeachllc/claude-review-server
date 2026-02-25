@@ -44,7 +44,7 @@ class TestLoadConfig:
         root = self._write_env(tmp_path, self._full_env())
         config = load_config(root)
         assert config["SERVER_NAME"] == "pr-review"
-        assert config["SERVER_TYPE"] == "cx22"
+        assert config["SERVER_TYPE"] == "cx11"
         assert config["SERVER_LOCATION"] == "fsn1"
         assert config["SERVER_IMAGE"] == "ubuntu-24.04"
 
