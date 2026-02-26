@@ -332,7 +332,7 @@ class TestFormatFileContents:
     def test_exact_boundary(self):
         """A single file whose formatted entry exactly hits max_chars."""
         files = [("x.py", "hello")]
-        entry = "### x.py\n```\nhello\n```\n"
+        entry = "### x.py\n~~~\nhello\n~~~\n"
         result, note = format_file_contents(files, max_chars=len(entry))
         assert result == entry
         assert note == ""
@@ -370,11 +370,11 @@ class TestFormatFileContents:
         assert "2 file(s) contents omitted" in note
 
     def test_output_wraps_in_code_blocks(self):
-        """Each file gets a markdown header and fenced code block."""
+        """Each file gets a markdown header and tilde-fenced code block."""
         files = [("app.py", "print('hi')")]
         result, _ = format_file_contents(files, max_chars=10_000)
-        assert result.startswith("### app.py\n```\n")
-        assert result.endswith("\n```\n")
+        assert result.startswith("### app.py\n~~~\n")
+        assert result.endswith("\n~~~\n")
 
 
 # ── fetch_file_contents ─────────────────────────────────
@@ -383,13 +383,15 @@ class TestFormatFileContents:
 class TestFetchFileContents:
     """Tests for fetch_file_contents filter logic (mocked subprocess)."""
 
-    def _make_run(self, responses: dict[str, str]):
-        """Return a fake subprocess.run that returns content keyed by filename."""
+    VALID_SHA = "a" * 40  # valid 40-char hex SHA
+
+    def _make_run(self, responses: dict[str, bytes]):
+        """Return a fake subprocess.run that returns bytes content keyed by filename."""
         class FakeResult:
             def __init__(self, stdout, returncode=0):
                 self.stdout = stdout
                 self.returncode = returncode
-                self.stderr = ""
+                self.stderr = b""
 
         def fake_run(cmd, **kwargs):
             # Extract filename from the gh api URL:
@@ -398,15 +400,15 @@ class TestFetchFileContents:
             path_part = url.split("/contents/")[1].split("?")[0]
             if path_part in responses:
                 return FakeResult(responses[path_part])
-            return FakeResult("", returncode=1)
+            return FakeResult(b"", returncode=1)
 
         return fake_run
 
     def test_skips_low_priority_files(self, monkeypatch):
         from agent import fetch_file_contents
-        fake = self._make_run({"package-lock.json": "{}", "app.py": "code"})
+        fake = self._make_run({"package-lock.json": b"{}", "app.py": b"code"})
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", ["package-lock.json", "app.py"])
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["package-lock.json", "app.py"])
         names = [name for name, _ in result]
         assert "app.py" in names
         assert "package-lock.json" not in names
@@ -414,47 +416,84 @@ class TestFetchFileContents:
     def test_caps_at_15_files(self, monkeypatch):
         from agent import fetch_file_contents
         all_files = [f"file{i}.py" for i in range(20)]
-        responses = {f: f"content_{f}" for f in all_files}
+        responses = {f: f"content_{f}".encode() for f in all_files}
         fake = self._make_run(responses)
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", all_files)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, all_files)
         assert len(result) == 15
 
     def test_skips_api_failures(self, monkeypatch):
         from agent import fetch_file_contents
         fake = self._make_run({})  # all files return rc=1
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", ["missing.py"])
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["missing.py"])
         assert result == []
 
     def test_skips_empty_content(self, monkeypatch):
         from agent import fetch_file_contents
-        fake = self._make_run({"empty.py": ""})
+        fake = self._make_run({"empty.py": b""})
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", ["empty.py"])
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["empty.py"])
         assert result == []
 
     def test_skips_oversized_files(self, monkeypatch):
         from agent import fetch_file_contents
-        fake = self._make_run({"huge.py": "x" * 60_000})
+        fake = self._make_run({"huge.py": b"x" * 60_000})
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", ["huge.py"])
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["huge.py"])
         assert result == []
 
     def test_skips_binary_files(self, monkeypatch):
         from agent import fetch_file_contents
-        fake = self._make_run({"image.py": "header\x00binary_data"})
+        fake = self._make_run({"image.py": b"header\x00binary_data"})
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", ["image.py"])
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["image.py"])
+        assert result == []
+
+    def test_skips_non_utf8_binary_files(self, monkeypatch):
+        """Files with invalid UTF-8 bytes are detected via replacement char."""
+        from agent import fetch_file_contents
+        fake = self._make_run({"bin.py": b"\x89PNG\r\n\x1a\nimage_data"})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["bin.py"])
         assert result == []
 
     def test_returns_valid_files(self, monkeypatch):
         from agent import fetch_file_contents
-        fake = self._make_run({"good.py": "import os\nprint('hello')\n"})
+        fake = self._make_run({"good.py": b"import os\nprint('hello')\n"})
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", "abc123", ["good.py"])
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["good.py"])
         assert len(result) == 1
         assert result[0] == ("good.py", "import os\nprint('hello')\n")
+
+    def test_rejects_invalid_sha(self, monkeypatch):
+        """Invalid head_sha format returns empty list without making API calls."""
+        from agent import fetch_file_contents
+        call_count = 0
+        def no_calls(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+        monkeypatch.setattr("agent.subprocess.run", no_calls)
+        result = fetch_file_contents("owner/repo", "not-a-sha", ["file.py"])
+        assert result == []
+        assert call_count == 0
+
+    def test_url_encodes_filenames(self, monkeypatch):
+        """Filenames with spaces/special chars are URL-encoded in the API call."""
+        from agent import fetch_file_contents
+        captured_urls = []
+        class FakeResult:
+            stdout = b"content"
+            returncode = 0
+            stderr = b""
+        def capture_run(cmd, **kwargs):
+            captured_urls.append(cmd[2])
+            return FakeResult()
+        monkeypatch.setattr("agent.subprocess.run", capture_run)
+        fetch_file_contents("owner/repo", self.VALID_SHA, ["path/to/my file.py"])
+        assert len(captured_urls) == 1
+        assert "my%20file.py" in captured_urls[0]
+        assert "my file.py" not in captured_urls[0]
 
 
 # ── prompt template rendering ────────────────────────────
@@ -477,7 +516,7 @@ class TestPromptRendering:
             pr_title=esc("Add feature"),
             pr_body=esc("Implements X"),
             truncation_note="",
-            file_contents=esc("### app.py\n```\nprint('hi')\n```\n"),
+            file_contents=esc("### app.py\n~~~\nprint('hi')\n~~~\n"),
             diff=esc("+import os\n"),
         )
         assert "PR #42" in result

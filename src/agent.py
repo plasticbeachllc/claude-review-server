@@ -13,6 +13,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import quote
 
 # ── Structured JSON logging ──────────────────────────────
 class JSONFormatter(logging.Formatter):
@@ -170,7 +171,7 @@ def format_file_contents(
     dropped: list[str] = []
     total = 0
     for name, content in sorted_files:
-        entry = f"### {name}\n```\n{content}\n```\n"
+        entry = f"### {name}\n~~~\n{content}\n~~~\n"
         if total + len(entry) <= max_chars:
             kept.append(entry)
             total += len(entry)
@@ -196,21 +197,34 @@ def fetch_file_contents(
     Skips low-priority, binary, and oversized (>50 KB) files.
     Fetches at most 15 files to limit API calls.
     """
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        log.warning(f"Invalid head SHA format: {head_sha!r}")
+        return []
+
     targets = [f for f in filenames if not is_low_priority(f)][:15]
     files: list[tuple[str, str]] = []
 
     for filename in targets:
+        encoded_path = quote(filename, safe="/")
         result = subprocess.run(
             ["gh", "api",
-             f"repos/{repo}/contents/{filename}?ref={head_sha}",
+             f"repos/{repo}/contents/{encoded_path}?ref={head_sha}",
              "-H", "Accept: application/vnd.github.raw+json"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, timeout=30,
         )
         if result.returncode != 0:
+            log.debug(f"Failed to fetch {filename} (rc={result.returncode})")
             continue
-        content = result.stdout
-        # Skip empty, binary, or oversized files
-        if not content or "\x00" in content[:8192] or len(content) > 50_000:
+        # Decode as UTF-8, replacing invalid bytes (binary files)
+        content = result.stdout.decode("utf-8", errors="replace")
+        if not content:
+            log.debug(f"Skipping empty file: {filename}")
+            continue
+        if "\ufffd" in content[:8192] or "\x00" in content[:8192]:
+            log.debug(f"Skipping binary file: {filename}")
+            continue
+        if len(content) > 50_000:
+            log.debug(f"Skipping oversized file ({len(content)} chars): {filename}")
             continue
         files.append((filename, content))
 
@@ -323,11 +337,11 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
                 raw_files, max_chars=MAX_FILE_CHARS,
             )
             if file_contents_str:
-                file_section = (
-                    "Full contents of changed files for context:\n"
-                    + (f"{file_note}\n\n" if file_note else "\n")
-                    + file_contents_str
-                )
+                parts = ["Full contents of changed files for context:"]
+                if file_note:
+                    parts.append(file_note)
+                parts.append(file_contents_str)
+                file_section = "\n\n".join(parts)
 
         # Escape braces in untrusted content so .format() doesn't choke
         # on diffs/bodies containing {variable_name} patterns.
