@@ -149,9 +149,10 @@ runcmd:
   - chown -R review:review /opt/pr-review
   - chmod 600 /opt/pr-review/.env
 
-  # ── Install cloudflared (via official apt repo — version-pinned to distro) ──
+  # ── Install cloudflared (via official apt repo — installs latest) ──
   # Pre-installed for both automated (`just provision`) and manual tunnel setup.
   # To activate: cloudflared service install <TUNNEL_TOKEN>
+  # Note: not version-pinned; pin with `cloudflared=<version>` if needed.
   - curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
   - echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
   - apt-get update && apt-get install -y cloudflared

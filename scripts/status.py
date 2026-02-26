@@ -63,7 +63,7 @@ def main():
             healthy = False
     except Exception:
         print("Service:  (SSH unreachable)")
-        sys.exit(1)
+        healthy = False
 
     try:
         # Port 8081 is the dedicated Caddy health endpoint (separate from the

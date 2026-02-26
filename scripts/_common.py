@@ -31,17 +31,17 @@ DEFAULTS = {
 }
 
 # SSH options for connecting to provisioned servers.
-# StrictHostKeyChecking=accept-new trusts the key on first connection and
-# rejects if it changes later.  The Hetzner API does not expose server host
-# keys, so there is no way to pre-seed known_hosts.  Since we connect to a
-# server we just created, the MITM window is minimal and this is standard
-# practice for cloud provisioning.
 #
-# UserKnownHostsFile=/dev/null prevents host key conflicts on
-# destroy-then-reprovision cycles (which may reuse IPs with new host keys).
-# Combined with StrictHostKeyChecking=no (needed because /dev/null means
-# every connection looks "new"), this is appropriate for single-tenant
-# ephemeral infrastructure managed by these scripts.
+# StrictHostKeyChecking=no accepts any host key without prompting.  Combined
+# with UserKnownHostsFile=/dev/null (so every connection looks "new" and no
+# stale keys accumulate), this avoids host key conflicts on destroy-then-
+# reprovision cycles where Hetzner may reuse IPs with new host keys.
+#
+# This is appropriate for single-tenant ephemeral infrastructure managed by
+# these scripts.  The Hetzner API does not expose server host keys, so there
+# is no way to pre-seed known_hosts; since we connect to a server we just
+# created, the MITM window is minimal and this is standard practice for
+# cloud provisioning.
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",

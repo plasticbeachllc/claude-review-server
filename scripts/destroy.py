@@ -116,8 +116,8 @@ def main():
     root = Path(__file__).resolve().parent.parent
     errors = []
 
-    # Accept --yes flag or positional "yes" to skip interactive confirmation
-    skip_confirm = "--yes" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "yes")
+    # Accept --yes flag to skip interactive confirmation (used by `just destroy`)
+    skip_confirm = "--yes" in sys.argv
 
     try:
         config = load_config(root)

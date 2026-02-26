@@ -1,7 +1,6 @@
 """Tests for provisioning scripts (config loading, API construction)."""
 
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -436,10 +435,10 @@ class TestAutoCleanup:
         config = {"SERVER_NAME": "test", "GITHUB_ORG": "org", "TUNNEL_HOSTNAME": "h"}
         created = {"server": "test", "tunnel": "h", "dns": "h", "webhook": "h"}
 
-        with patch("destroy.delete_webhook") as dw, \
-             patch("destroy.delete_dns_record") as dd, \
-             patch("destroy.delete_tunnel") as dt, \
-             patch("destroy.delete_server") as ds:
+        with patch("provision.delete_webhook") as dw, \
+             patch("provision.delete_dns_record") as dd, \
+             patch("provision.delete_tunnel") as dt, \
+             patch("provision.delete_server") as ds:
             _auto_cleanup(created, config)
 
         dw.assert_called_once_with(config)
@@ -459,9 +458,9 @@ class TestAutoCleanup:
         config = {"SERVER_NAME": "test"}
         created = {"server": "test", "tunnel": "h", "dns": "h"}
 
-        with patch("destroy.delete_dns_record", side_effect=Exception("boom")), \
-             patch("destroy.delete_tunnel") as dt, \
-             patch("destroy.delete_server") as ds:
+        with patch("provision.delete_dns_record", side_effect=Exception("boom")), \
+             patch("provision.delete_tunnel") as dt, \
+             patch("provision.delete_server") as ds:
             # Should not raise despite delete_dns_record failing
             _auto_cleanup(created, config)
 
@@ -476,8 +475,8 @@ class TestAutoCleanup:
         # DNS was created but setup_tunnel failed before recording "tunnel"
         created = {"server": "test", "dns": "h"}
 
-        with patch("destroy.delete_dns_record") as dd, \
-             patch("destroy.delete_server") as ds:
+        with patch("provision.delete_dns_record") as dd, \
+             patch("provision.delete_server") as ds:
             _auto_cleanup(created, config)
 
         dd.assert_called_once_with(config)
@@ -798,16 +797,15 @@ class TestInjectAuth:
         from provision import inject_auth
 
         mock_ssh.return_value = "/usr/bin/gh"
-        # 3 subprocess.run calls: gh auth, mktemp upload, python3 upsert
+        # 2 subprocess.run calls: gh auth, sed upsert
         mock_run.side_effect = [
-            MagicMock(returncode=0, stderr="", stdout=""),          # gh auth login
-            MagicMock(returncode=0, stderr="", stdout="/tmp/xyz"),  # mktemp upload
-            MagicMock(returncode=0, stderr="", stdout=""),          # python3 upsert
+            MagicMock(returncode=0, stderr="", stdout=""),  # gh auth login
+            MagicMock(returncode=0, stderr="", stdout=""),  # sed upsert
         ]
 
         inject_auth("1.2.3.4", self._config())  # should not raise
 
-        assert mock_run.call_count == 3
+        assert mock_run.call_count == 2
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
@@ -817,7 +815,6 @@ class TestInjectAuth:
         mock_ssh.return_value = "/usr/bin/gh"
         mock_run.side_effect = [
             MagicMock(returncode=0, stderr="", stdout=""),
-            MagicMock(returncode=0, stderr="", stdout="/tmp/xyz"),
             MagicMock(returncode=0, stderr="", stdout=""),
         ]
 
