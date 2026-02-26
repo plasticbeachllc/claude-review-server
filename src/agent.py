@@ -56,7 +56,8 @@ def get_prompt_template() -> str:
 
 # Files to drop first when truncating large diffs
 LOW_PRIORITY_PATTERNS = [
-    r"(package-lock|yarn\.lock|pnpm-lock|Cargo\.lock|go\.sum|composer\.lock)",
+    r"(package-lock|yarn\.lock|pnpm-lock|Cargo\.lock|go\.sum|composer\.lock|"
+    r"uv\.lock|poetry\.lock|Pipfile\.lock|Gemfile\.lock|bun\.lockb)",
     r"\.(generated|min)\.(js|css|ts)$",
     r"__snapshots__/",
     r"\.svg$",
@@ -65,9 +66,19 @@ LOW_PRIORITY_PATTERNS = [
 ]
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+PORT = int(os.environ.get("PORT", "8080"))
+DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "30"))
+MAX_COMMENT_CHARS = 65_000  # GitHub comment limit is 65536
 
 # Regex for extracting the filename from "diff --git a/path b/path"
 DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+# Debounce tracking: maps "repo#number" -> Timer.
+# When a new event arrives, the previous timer is cancelled and a new one
+# is started.  This avoids consuming executor threads with sleeping workers.
+_debounce_timers: dict[str, threading.Timer] = {}
+_debounce_lock = threading.Lock()
+_shutting_down = threading.Event()
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -298,6 +309,35 @@ def collapse_old_reviews(repo: str, pr_number: int):
         )
 
 
+def _schedule_debounced_review(repo: str, pr_number: int, pr_title: str,
+                               action: str):
+    """Schedule a review after the debounce window using threading.Timer.
+
+    Cancels any previously scheduled timer for the same PR so only the
+    last event in a burst actually triggers a review.  The timer fires
+    outside the executor, so sleeping doesn't consume worker slots.
+    """
+    key = f"{repo}#{pr_number}"
+
+    def _fire():
+        with _debounce_lock:
+            _debounce_timers.pop(key, None)
+        if _shutting_down.is_set():
+            log.info(f"Skipping debounced review for {key} (shutting down)")
+            return
+        executor.submit(review_pr, repo, pr_number, pr_title, action)
+
+    with _debounce_lock:
+        old = _debounce_timers.get(key)
+        if old is not None:
+            old.cancel()
+            log.info(f"Debounced {key} (superseded by newer event)")
+        timer = threading.Timer(DEBOUNCE_SECONDS, _fire)
+        timer.daemon = True
+        _debounce_timers[key] = timer
+        timer.start()
+
+
 def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
     """Fetch diff, invoke Claude, post review comment."""
     log.info(f"Reviewing {repo}#{pr_number}: {pr_title} ({action})")
@@ -400,12 +440,21 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             return
 
         header = "🔄 Updated Review" if action == "synchronize" else "📝 Review"
+        footer = "\n\n---\n*Automated review by Claude Code*"
+
+        # Truncate if review would exceed GitHub's comment size limit
+        overhead = len(f"{REVIEW_MARKER}\n## {header}\n\n") + len(footer)
+        max_review = MAX_COMMENT_CHARS - overhead
+        if len(review_text) > max_review:
+            truncation_msg = "\n\n*(Review truncated — exceeded GitHub comment size limit)*"
+            review_text = review_text[:max_review - len(truncation_msg)] + truncation_msg
+            log.warning(f"Truncated review for {repo}#{pr_number} to fit comment limit")
+
         comment = (
             f"{REVIEW_MARKER}\n"
             f"## {header}\n\n"
-            f"{review_text}\n\n"
-            f"---\n"
-            f"*Automated review by Claude Code*"
+            f"{review_text}"
+            f"{footer}"
         )
 
         post_result = subprocess.run(
@@ -434,7 +483,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self.send_response(400)
+            self.end_headers()
+            return
         if length > 5_000_000:  # 5 MB sanity limit
             log.warning(f"Payload too large ({length} bytes) from {self.client_address[0]}")
             self.send_response(413)
@@ -459,23 +513,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if event != "pull_request":
             return
 
-        data = json.loads(payload)
-        action = data.get("action")
-        if action not in ("opened", "synchronize"):
-            return
+        try:
+            data = json.loads(payload)
+            action = data.get("action")
+            if action not in ("opened", "synchronize"):
+                return
 
-        pr = data["pull_request"]
-        if pr.get("draft", False):
-            log.info(f"Skipping draft PR #{pr['number']}")
-            return
+            pr = data["pull_request"]
+            if pr.get("draft", False):
+                log.info(f"Skipping draft PR #{pr['number']}")
+                return
 
-        executor.submit(
-            review_pr,
-            data["repository"]["full_name"],
-            pr["number"],
-            pr["title"],
-            action,
-        )
+            repo = data["repository"]["full_name"]
+            number = pr["number"]
+            title = pr["title"]
+
+            # Debounce rapid force-pushes: delay "synchronize" events so
+            # only the last push in a burst actually triggers a review.
+            if action == "synchronize" and DEBOUNCE_SECONDS > 0:
+                _schedule_debounced_review(repo, number, title, action)
+            else:
+                executor.submit(review_pr, repo, number, title, action)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            log.error(f"Malformed webhook payload: {e}")
 
     def do_GET(self):
         if self.path == "/health":
@@ -493,17 +553,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("127.0.0.1", port), WebhookHandler)
+    server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
 
-    def _shutdown(signum, frame):
-        log.info(f"Received signal {signum}, shutting down...")
-        threading.Thread(target=server.shutdown, daemon=True).start()
-        executor.shutdown(wait=False, cancel_futures=True)
+    def _do_shutdown():
+        """Perform blocking shutdown work off the signal handler thread."""
+        _shutting_down.set()
+        # Cancel any pending debounce timers
+        with _debounce_lock:
+            for timer in _debounce_timers.values():
+                timer.cancel()
+            _debounce_timers.clear()
+        server.shutdown()
+        executor.shutdown(wait=True, cancel_futures=False)
+
+    def _shutdown(signum, _frame):
+        log.info(f"Received {signal.Signals(signum).name}, shutting down...")
+        threading.Thread(target=_do_shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log.info(f"PR Review Agent listening on 127.0.0.1:{port} "
+    log.info(f"PR Review Agent listening on 127.0.0.1:{PORT} "
              f"(workers={MAX_WORKERS})")
     server.serve_forever()

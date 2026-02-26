@@ -85,6 +85,11 @@ class TestIsLowPriority:
             "icons/logo.svg",
             "vendor/github.com/lib/pq/conn.go",
             "proto/api.pb.go",
+            "uv.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "Gemfile.lock",
+            "bun.lockb",
         ],
     )
     def test_low_priority_files(self, filename):
@@ -1148,8 +1153,8 @@ class TestWebhookHandlerPost:
         assert call_args[0][3] == "My PR"
         assert call_args[0][4] == "opened"
 
-    @patch("agent.executor")
-    def test_pr_synchronize_submits_review(self, mock_executor, http_server):
+    @patch("agent._schedule_debounced_review")
+    def test_pr_synchronize_schedules_debounce(self, mock_debounce, http_server):
         payload = _make_pr_payload(action="synchronize", number=10)
         sig = _sign_payload(payload)
         headers = {
@@ -1160,8 +1165,11 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        mock_executor.submit.assert_called_once()
-        assert mock_executor.submit.call_args[0][4] == "synchronize"
+        mock_debounce.assert_called_once()
+        call_args = mock_debounce.call_args[0]
+        assert call_args[0] == "owner/repo"
+        assert call_args[1] == 10
+        assert call_args[3] == "synchronize"
 
     @patch("agent.executor")
     def test_pr_closed_does_not_submit(self, mock_executor, http_server):

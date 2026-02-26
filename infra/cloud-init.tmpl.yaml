@@ -90,6 +90,7 @@ runcmd:
   - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   - apt-get install -y nodejs
   - npm install -g @anthropic-ai/claude-code@latest
+  - echo "Installed claude-code version:" && npm list -g @anthropic-ai/claude-code --depth=0
 
   # ── Install GitHub CLI ────────────────────────────────────
   - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -174,6 +175,7 @@ runcmd:
   # ── Enable services (don't start pr-review yet — needs auth) ──
   - systemctl daemon-reload
   - systemctl enable caddy
+  - systemctl restart caddy
   - systemctl enable pr-review
   - |
     echo ""
