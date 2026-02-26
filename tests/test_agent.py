@@ -376,6 +376,19 @@ class TestFormatFileContents:
         assert result.startswith("### app.py\n~~~\n")
         assert result.endswith("\n~~~\n")
 
+    def test_no_double_blank_lines_between_files(self):
+        """Multiple files are joined without extra blank lines."""
+        files = [
+            ("a.py", "aaa"),
+            ("b.py", "bbb"),
+        ]
+        result, _ = format_file_contents(files, max_chars=100_000)
+        # Each entry ends with \n, so joining directly gives \n###
+        # There should be no \n\n### (double blank line) between entries
+        assert "\n\n###" not in result
+        assert "### a.py" in result
+        assert "### b.py" in result
+
 
 # ── fetch_file_contents ─────────────────────────────────
 
@@ -450,13 +463,15 @@ class TestFetchFileContents:
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["image.py"])
         assert result == []
 
-    def test_skips_non_utf8_binary_files(self, monkeypatch):
-        """Files with invalid UTF-8 bytes are detected via replacement char."""
+    def test_passes_non_null_non_ascii_files(self, monkeypatch):
+        """Files with non-ASCII bytes but no null bytes are accepted (not false-positive)."""
         from agent import fetch_file_contents
-        fake = self._make_run({"bin.py": b"\x89PNG\r\n\x1a\nimage_data"})
+        # PNG header without null bytes — should NOT be rejected
+        fake = self._make_run({"text.py": b"\xc3\xa9\xc3\xa0 unicode ok"})
         monkeypatch.setattr("agent.subprocess.run", fake)
-        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["bin.py"])
-        assert result == []
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["text.py"])
+        assert len(result) == 1
+        assert result[0][0] == "text.py"
 
     def test_returns_valid_files(self, monkeypatch):
         from agent import fetch_file_contents
@@ -475,6 +490,23 @@ class TestFetchFileContents:
             call_count += 1
         monkeypatch.setattr("agent.subprocess.run", no_calls)
         result = fetch_file_contents("owner/repo", "not-a-sha", ["file.py"])
+        assert result == []
+        assert call_count == 0
+
+    def test_rejects_invalid_repo_format(self, monkeypatch):
+        """Malformed repo names (e.g. path traversal) are rejected without API calls."""
+        from agent import fetch_file_contents
+        call_count = 0
+        def no_calls(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+        monkeypatch.setattr("agent.subprocess.run", no_calls)
+        # Path traversal attempt
+        result = fetch_file_contents("owner/../evil", self.VALID_SHA, ["file.py"])
+        assert result == []
+        assert call_count == 0
+        # Missing slash
+        result = fetch_file_contents("noslash", self.VALID_SHA, ["file.py"])
         assert result == []
         assert call_count == 0
 
@@ -562,6 +594,31 @@ class TestPromptRendering:
             diff=esc("+x\n"),
         )
         assert "{key: value}" in result
+
+    def test_empty_placeholders_no_triple_blank_lines(self):
+        """Empty truncation_note and file_contents don't produce triple+ blank lines
+        after collapsing (as done in review_pr)."""
+        import re as re_mod
+        from agent import get_prompt_template
+        template = get_prompt_template()
+
+        def esc(s):
+            return s.replace("{", "{{").replace("}", "}}")
+
+        result = template.format(
+            pr_number=1,
+            repo="a/b",
+            pr_title=esc("Fix"),
+            pr_body=esc("(none)"),
+            truncation_note="",
+            file_contents="",
+            diff=esc("+x\n"),
+        )
+        # Simulate the same collapsing done in review_pr
+        result = re_mod.sub(r"\n{3,}", "\n\n", result)
+        assert "\n\n\n" not in result
+        # Content should still be present
+        assert "Diff (changes to review):" in result
 
 
 # ── build.py ─────────────────────────────────────────────

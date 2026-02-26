@@ -160,11 +160,16 @@ def format_file_contents(
     """Format file contents with priority-based truncation.
 
     Returns (formatted_contents, truncation_note).
+
+    Note: the is_low_priority sort is intentionally kept even though
+    fetch_file_contents already filters low-priority files. This makes
+    format_file_contents safe for standalone use with arbitrary inputs.
     """
     if not files:
         return "", ""
 
-    # Sort: high-priority first, then smaller files first
+    # Sort: high-priority first, then smaller files first (defensive —
+    # callers may pass unfiltered file lists)
     sorted_files = sorted(files, key=lambda x: (is_low_priority(x[0]), len(x[1])))
 
     kept: list[str] = []
@@ -186,7 +191,7 @@ def format_file_contents(
             f"{'...' if len(dropped) > 10 else ''})"
         )
 
-    return "\n".join(kept), note
+    return "".join(kept), note
 
 
 def fetch_file_contents(
@@ -197,6 +202,9 @@ def fetch_file_contents(
     Skips low-priority, binary, and oversized (>50 KB) files.
     Fetches at most 15 files to limit API calls.
     """
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        log.warning(f"Invalid repo format: {repo!r}")
+        return []
     if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         log.warning(f"Invalid head SHA format: {head_sha!r}")
         return []
@@ -215,12 +223,12 @@ def fetch_file_contents(
         if result.returncode != 0:
             log.debug(f"Failed to fetch {filename} (rc={result.returncode})")
             continue
-        # Decode as UTF-8, replacing invalid bytes (binary files)
+        # Decode as UTF-8; null bytes are a strong binary signal
         content = result.stdout.decode("utf-8", errors="replace")
         if not content:
             log.debug(f"Skipping empty file: {filename}")
             continue
-        if "\ufffd" in content[:8192] or "\x00" in content[:8192]:
+        if "\x00" in content[:8192]:
             log.debug(f"Skipping binary file: {filename}")
             continue
         if len(content) > 50_000:
@@ -332,14 +340,27 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
         file_section = ""
         if head_sha:
             filenames = extract_diff_filenames(diff_result.stdout)
+            fetchable = [f for f in filenames if not is_low_priority(f)]
             raw_files = fetch_file_contents(repo, head_sha, filenames)
             file_contents_str, file_note = format_file_contents(
                 raw_files, max_chars=MAX_FILE_CHARS,
             )
+            # Surface the 15-file fetch cap if it was hit
+            notes = []
+            capped = len(fetchable) - 15
+            if capped > 0:
+                names = ", ".join(fetchable[15:25])
+                suffix = "..." if capped > 10 else ""
+                notes.append(
+                    f"({capped} file(s) not fetched due to 15-file limit: "
+                    f"{names}{suffix})"
+                )
+            if file_note:
+                notes.append(file_note)
+
             if file_contents_str:
                 parts = ["Full contents of changed files for context:"]
-                if file_note:
-                    parts.append(file_note)
+                parts.extend(notes)
                 parts.append(file_contents_str)
                 file_section = "\n\n".join(parts)
 
@@ -357,6 +378,8 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             file_contents=esc(file_section),
             diff=esc(diff),
         )
+        # Collapse runs of blank lines left by empty placeholders
+        prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],
