@@ -253,8 +253,12 @@ class TestAlreadyReviewed:
         already_reviewed("org/my-repo", 99)
 
         args = mock_run.call_args[0][0]
+        assert args[0] == "gh"
+        # Verify --repo flag is followed by the repo name
+        repo_idx = args.index("--repo")
+        assert args[repo_idx + 1] == "org/my-repo"
+        # PR number should be passed as a positional string arg
         assert "99" in args
-        assert "org/my-repo" in args
 
     @patch("agent.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30))
     def test_propagates_timeout(self, mock_run):
@@ -350,7 +354,8 @@ class TestCollapseOldReviews:
         assert mock_run.call_count == 1
 
     @patch("agent.subprocess.run")
-    def test_strips_marker_from_collapsed_body(self, mock_run):
+    def test_deduplicates_marker_in_collapsed_body(self, mock_run):
+        """Marker appears once at the top of the collapsed body, not duplicated inside <details>."""
         original_body = f"{REVIEW_MARKER}\n## Review\nGreat code!"
         comment_json = json.dumps({"id": 5, "body": original_body})
         mock_run.side_effect = [
@@ -362,25 +367,16 @@ class TestCollapseOldReviews:
 
         patch_args = mock_run.call_args_list[1][0][0]
         body_arg = [a for a in patch_args if a.startswith("body=")][0]
-        # The marker should appear once (at the top), not duplicated inside <details>
         assert body_arg.count(REVIEW_MARKER) == 1
 
 
 # ── review_pr ───────────────────────────────────────────
 
 
-def _find_call(mock_run, keyword):
-    """Find a subprocess.run call whose first arg contains the given keyword."""
+def _find_call_with_arg(mock_run, arg):
+    """Find a subprocess.run call whose argv list contains `arg` as an exact element."""
     return next(
-        (c for c in mock_run.call_args_list if keyword in c[0][0]),
-        None,
-    )
-
-
-def _find_call_with_body(mock_run):
-    """Find a subprocess.run call that includes '--body' (the comment post)."""
-    return next(
-        (c for c in mock_run.call_args_list if "--body" in c[0][0]),
+        (c for c in mock_run.call_args_list if arg in c[0][0]),
         None,
     )
 
@@ -409,7 +405,7 @@ class TestReviewPr:
         # Should have called: already_reviewed, diff, body, claude, comment
         assert mock_run.call_count == 5
         # Verify claude was called with the prompt
-        claude_call = _find_call(mock_run, "claude")
+        claude_call = _find_call_with_arg(mock_run,"claude")
         assert claude_call is not None
 
     @patch("agent.subprocess.run")
@@ -441,9 +437,9 @@ class TestReviewPr:
         review_pr("owner/repo", 2, "Update feature", "synchronize")
 
         # First call should be the collapse_old_reviews (gh api), not already_reviewed
-        assert _find_call(mock_run, "api") is not None
+        assert _find_call_with_arg(mock_run,"api") is not None
         # Verify "Updated Review" header in posted comment
-        comment_call = _find_call_with_body(mock_run)
+        comment_call = _find_call_with_arg(mock_run, "--body")
         assert comment_call is not None
         comment_args = comment_call[0][0]
         body_idx = comment_args.index("--body") + 1
@@ -466,6 +462,8 @@ class TestReviewPr:
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
     def test_returns_on_empty_diff(self, mock_template, mock_run):
+        # Note: review_pr fetches the PR body before checking diff emptiness.
+        # This mirrors the production ordering (diff → body → empty check).
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),     # already_reviewed
             _subprocess_result(stdout="   \n"),   # gh pr diff — whitespace only
@@ -529,8 +527,9 @@ class TestReviewPr:
             subprocess.TimeoutExpired(cmd="gh", timeout=60),
         ]
 
-        # Should not raise — timeout is caught
+        # Should not raise — timeout is caught after already_reviewed + diff fetch
         review_pr("owner/repo", 1, "Fix", "opened")
+        assert mock_run.call_count == 2
 
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
@@ -547,7 +546,7 @@ class TestReviewPr:
         review_pr("owner/repo", 1, "Fix {something}", "opened")
 
         # Verify claude was called (format didn't crash)
-        assert _find_call(mock_run, "claude") is not None
+        assert _find_call_with_arg(mock_run,"claude") is not None
 
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
@@ -562,7 +561,7 @@ class TestReviewPr:
 
         review_pr("owner/repo", 1, "Fix", "opened")
 
-        comment_call = _find_call_with_body(mock_run)
+        comment_call = _find_call_with_arg(mock_run, "--body")
         assert comment_call is not None
         comment_args = comment_call[0][0]
         body_idx = comment_args.index("--body") + 1
@@ -699,7 +698,10 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        # executor.submit() is called synchronously inside do_POST
+        # executor.submit() is called synchronously inside do_POST before
+        # the response is sent, so the mock is already populated here.
+        # If do_POST is ever refactored to dispatch asynchronously *after*
+        # the response, this assertion would need a sync mechanism.
         mock_executor.submit.assert_called_once()
         call_args = mock_executor.submit.call_args
         assert call_args[0][0] == review_pr
@@ -763,9 +765,11 @@ class TestWebhookHandlerPost:
         mock_executor.submit.assert_not_called()
 
     def test_oversized_payload_returns_413(self, http_server):
-        # Use a small payload with a lying Content-Length header to avoid
-        # actually sending 5MB over the wire. The server checks the header
-        # value before reading the body, so this reliably triggers 413.
+        # Relies on do_POST checking Content-Length *before* reading the body.
+        # We send a small payload with an inflated Content-Length header to
+        # avoid pushing 5MB over loopback. If the handler is ever refactored
+        # to read-then-check, this test must be updated to send an actual
+        # oversized payload.
         payload = b"x" * 1024
         headers = {
             "Content-Length": "5000001",
