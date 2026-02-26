@@ -92,11 +92,19 @@ def _local_key_fingerprint(pubkey_content: str) -> str:
     """Compute the MD5 fingerprint of a local SSH public key.
 
     Returns the fingerprint in the ``aa:bb:cc:...`` format used by Hetzner.
+
+    Uses a temporary file rather than ``ssh-keygen -lf -`` (stdin) because
+    reading from stdin requires OpenSSH >= 6.9.
     """
-    result = subprocess.run(
-        ["ssh-keygen", "-lf", "-", "-E", "md5"],
-        input=pubkey_content, capture_output=True, text=True, timeout=10,
-    )
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".pub", delete=True) as tmp:
+        tmp.write(pubkey_content)
+        tmp.flush()
+        result = subprocess.run(
+            ["ssh-keygen", "-lf", tmp.name, "-E", "md5"],
+            capture_output=True, text=True, timeout=10,
+        )
     if result.returncode != 0:
         raise ProvisionError(f"ssh-keygen failed: {result.stderr.strip()}")
     # Output format: "2048 MD5:aa:bb:cc:... comment (RSA)"
@@ -224,8 +232,8 @@ def inject_auth(ip: str, config: dict):
          "TOKEN=$(cat) && "
          "TMPFILE=$(mktemp) && "
          "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > \"$TMPFILE\" && "
+         "chmod 600 \"$TMPFILE\" && "
          "mv \"$TMPFILE\" /opt/pr-review/.env && "
-         "chmod 600 /opt/pr-review/.env && "
          "printf 'CLAUDE_CODE_AUTH_TOKEN=%s\\n' \"${TOKEN}\" >> /opt/pr-review/.env && "
          "grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],

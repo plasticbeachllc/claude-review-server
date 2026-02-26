@@ -108,7 +108,11 @@ def delete_tunnel(config: dict):
 
 
 def delete_server(config: dict):
-    """Delete the Hetzner server by name."""
+    """Delete the Hetzner server by name.
+
+    Waits for the Hetzner API to confirm deletion is complete before
+    returning, so callers aren't surprised by a still-running server.
+    """
     client = Client(token=config["HCLOUD_TOKEN"])
     name = config["SERVER_NAME"]
     server = client.servers.get_by_name(name)
@@ -116,7 +120,10 @@ def delete_server(config: dict):
         print("  No matching server found (already deleted?)")
         return
 
-    client.servers.delete(server)
+    response = client.servers.delete(server)
+    if response is not None:
+        # hcloud-python returns a BoundAction; wait for it to finish
+        response.wait_until_finished()
     print(f"  Deleted server '{name}' (id={server.id})")
 
 

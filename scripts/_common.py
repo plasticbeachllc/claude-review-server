@@ -151,13 +151,19 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
             out = ssh(ip, "cloud-init status --format json 2>/dev/null || echo '{}'", timeout=30)
             data = json.loads(out) if out else {}
             status = data.get("status", "")
-            if status in ("done", "degraded"):
-                if status == "degraded":
-                    print(f" degraded (some modules failed)")
-                    print(f"  Warning: cloud-init degraded — check: ssh root@{ip} cloud-init status --long")
-                else:
-                    print(" done")
+            if status == "done":
+                print(" done")
                 return
+            if status == "degraded":
+                # Fetch verbose output for debugging
+                try:
+                    long_out = ssh(ip, "cloud-init status --long 2>/dev/null || true", timeout=10)
+                except Exception:
+                    long_out = ""
+                msg = f"cloud-init degraded (some modules failed)"
+                if long_out:
+                    msg += f"\n{long_out}"
+                raise CloudInitError(msg)
             if status == "error":
                 detail = data.get("extended_status", data.get("status", "unknown"))
                 # Fetch verbose output for debugging
@@ -235,5 +241,5 @@ def cf_request(method: str, path: str, token: str, **kwargs) -> dict:
         )
     if not data.get("success"):
         errors = data.get("errors", [])
-        raise ProvisionError(f"Cloudflare API error: {errors}")
+        raise ProvisionError(f"Cloudflare API error (HTTP {resp.status_code}): {errors}")
     return data

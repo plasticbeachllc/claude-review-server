@@ -217,12 +217,13 @@ class TestCfRequest:
         from _common import ProvisionError, cf_request
 
         mock_request.return_value = MagicMock(
+            status_code=403,
             json=lambda: {
                 "success": False,
                 "errors": [{"code": 1000, "message": "bad request"}],
             },
         )
-        with pytest.raises(ProvisionError, match="Cloudflare API error"):
+        with pytest.raises(ProvisionError, match=r"Cloudflare API error \(HTTP 403\)"):
             cf_request("GET", "/test", "token")
 
     @patch("_common.requests.request")
@@ -779,6 +780,20 @@ class TestWaitForCloudInit:
 
         with pytest.raises(ProvisionError, match="cloud-init did not finish"):
             wait_for_cloud_init("1.2.3.4", timeout=600)
+
+    @patch("_common.time.sleep")
+    @patch("_common.ssh")
+    def test_raises_on_degraded_status(self, mock_ssh, mock_sleep):
+        from _common import CloudInitError, wait_for_cloud_init
+
+        # First call returns degraded status; second fetches --long diagnostic
+        mock_ssh.side_effect = [
+            json.dumps({"status": "degraded"}),
+            "status: degraded\ndetail: some modules failed",
+        ]
+
+        with pytest.raises(CloudInitError, match="cloud-init degraded"):
+            wait_for_cloud_init("1.2.3.4", timeout=60)
 
     @patch("_common.time.sleep")
     @patch("_common.time.time")

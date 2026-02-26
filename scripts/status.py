@@ -18,6 +18,7 @@ Usage:
 import sys
 from pathlib import Path
 
+import requests
 from hcloud import Client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -82,6 +83,19 @@ def main():
     except Exception:
         print("Health:   (check failed)")
         healthy = False
+
+    # Check tunnel reachability from the outside (if configured)
+    if hostname:
+        try:
+            resp = requests.get(f"https://{hostname}/health", timeout=10)
+            if resp.status_code == 200:
+                print(f"Tunnel:   reachable")
+            else:
+                print(f"Tunnel:   HTTP {resp.status_code}")
+                healthy = False
+        except requests.RequestException:
+            print("Tunnel:   unreachable")
+            healthy = False
 
     if not healthy:
         sys.exit(2)  # exit 2 = running but unhealthy
