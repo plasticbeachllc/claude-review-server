@@ -225,6 +225,15 @@ class TestCfRequest:
         with pytest.raises(ProvisionError, match="Cloudflare API error"):
             cf_request("GET", "/test", "token")
 
+    @patch("_common.requests.request")
+    def test_handles_204_no_content(self, mock_request):
+        from _common import cf_request
+
+        mock_request.return_value = MagicMock(status_code=204)
+        result = cf_request("DELETE", "/test/path", "my-token")
+
+        assert result == {"success": True, "result": None}
+
 
 # ── GitHub pagination ──────────────────────────────────────
 
@@ -507,12 +516,17 @@ class TestSetupTunnel:
             "SERVER_NAME": "pr-review",
         }
 
+    def _zone_response(self):
+        """Zone validation response for review.example.com."""
+        return {"result": {"name": "example.com"}}
+
     @patch("provision.subprocess.run")
     @patch("provision.cf_request")
     def test_creates_new_tunnel_and_dns(self, mock_cf, mock_run):
         from provision import setup_tunnel
 
         # cf_request responses in order:
+        # 0. GET zone (validation)
         # 1. GET tunnels (empty — no existing)
         # 2. POST create tunnel
         # 3. PUT ingress config
@@ -520,6 +534,7 @@ class TestSetupTunnel:
         # 5. POST create DNS
         # 6. GET connector token
         mock_cf.side_effect = [
+            self._zone_response(),
             {"result": []},
             {"result": {"id": "tun-123"}},
             {"result": {}},
@@ -532,10 +547,10 @@ class TestSetupTunnel:
         hostname = setup_tunnel(self._config(), "1.2.3.4")
 
         assert hostname == "review.example.com"
-        # Verify tunnel creation was POSTed
-        assert mock_cf.call_args_list[1][0][0] == "POST"
+        # Verify tunnel creation was POSTed (index shifted +1 for zone check)
+        assert mock_cf.call_args_list[2][0][0] == "POST"
         # Verify DNS creation was POSTed
-        assert mock_cf.call_args_list[4][0][0] == "POST"
+        assert mock_cf.call_args_list[5][0][0] == "POST"
 
     @patch("provision.subprocess.run")
     @patch("provision.cf_request")
@@ -543,6 +558,7 @@ class TestSetupTunnel:
         from provision import setup_tunnel
 
         mock_cf.side_effect = [
+            self._zone_response(),                                # GET zone
             {"result": [{"id": "existing-tun"}]},  # GET tunnels — found existing
             {"result": {}},                          # PUT ingress config
             {"result": []},                          # GET DNS records
@@ -554,9 +570,9 @@ class TestSetupTunnel:
         hostname = setup_tunnel(self._config(), "1.2.3.4")
 
         assert hostname == "review.example.com"
-        # Should NOT have POSTed a new tunnel (call 0 is GET, call 1 is PUT ingress)
-        assert mock_cf.call_args_list[0][0][0] == "GET"
-        assert mock_cf.call_args_list[1][0][0] == "PUT"
+        # call 0 is GET zone, call 1 is GET tunnels, call 2 is PUT ingress
+        assert mock_cf.call_args_list[1][0][0] == "GET"
+        assert mock_cf.call_args_list[2][0][0] == "PUT"
 
     @patch("provision.subprocess.run")
     @patch("provision.cf_request")
@@ -564,6 +580,7 @@ class TestSetupTunnel:
         from provision import setup_tunnel
 
         mock_cf.side_effect = [
+            self._zone_response(),                               # GET zone
             {"result": [{"id": "tun-1"}]},                    # GET tunnels — existing
             {"result": {}},                                     # PUT ingress
             {"result": [{"id": "dns-rec-1"}]},                 # GET DNS — existing record
@@ -574,8 +591,8 @@ class TestSetupTunnel:
 
         setup_tunnel(self._config(), "1.2.3.4")
 
-        # DNS step should be PUT (update), not POST (create)
-        dns_call = mock_cf.call_args_list[3]
+        # DNS step should be PUT (update), not POST (create) — index shifted +1
+        dns_call = mock_cf.call_args_list[4]
         assert dns_call[0][0] == "PUT"
         assert "dns-rec-1" in dns_call[0][1]
 
@@ -586,6 +603,7 @@ class TestSetupTunnel:
         from provision import setup_tunnel
 
         mock_cf.side_effect = [
+            self._zone_response(),
             {"result": [{"id": "tun-1"}]},
             {"result": {}},
             {"result": []},
@@ -604,6 +622,7 @@ class TestSetupTunnel:
         from provision import setup_tunnel
 
         mock_cf.side_effect = [
+            self._zone_response(),
             {"result": []},
             {"result": {"id": "tun-new"}},
             {"result": {}},
@@ -627,6 +646,7 @@ class TestSetupTunnel:
         from provision import setup_tunnel
 
         mock_cf.side_effect = [
+            self._zone_response(),
             {"result": [{"id": "tun-1"}]},
             {"result": {}},
             {"result": []},
@@ -642,6 +662,18 @@ class TestSetupTunnel:
         # DNS and tunnel should be tracked even though cloudflared failed
         assert "tunnel" in created
         assert "dns" in created
+
+    @patch("provision.cf_request")
+    def test_raises_on_zone_mismatch(self, mock_cf):
+        """TUNNEL_HOSTNAME must belong to the zone identified by CF_ZONE_ID."""
+        from _common import ProvisionError
+        from provision import setup_tunnel
+
+        # Zone is otherdomain.com, but hostname is review.example.com
+        mock_cf.return_value = {"result": {"name": "otherdomain.com"}}
+
+        with pytest.raises(ProvisionError, match="does not belong to zone"):
+            setup_tunnel(self._config(), "1.2.3.4")
 
 
 # ── wait_for_ssh ──────────────────────────────────────────
@@ -683,11 +715,15 @@ class TestWaitForSsh:
         from _common import ProvisionError, wait_for_ssh
 
         mock_ssh.side_effect = ProvisionError("refused")
-        # time() returns: start, first check (past deadline)
-        mock_time.side_effect = [0, 301]
+        # time() returns: start, check1 (in window → retry), check2 (past deadline)
+        mock_time.side_effect = [0, 1, 301]
 
         with pytest.raises(ProvisionError, match="SSH not reachable after 300s"):
             wait_for_ssh("1.2.3.4", timeout=300)
+
+        # Verify the retry loop actually executed at least once
+        assert mock_ssh.call_count >= 1
+        assert mock_sleep.call_count >= 1
 
 
 # ── wait_for_cloud_init ──────────────────────────────────
@@ -823,3 +859,7 @@ class TestInjectAuth:
         # First subprocess.run call should pipe GH_TOKEN via stdin
         first_call = mock_run.call_args_list[0]
         assert first_call[1]["input"] == "ghp_test_token"
+
+        # Second subprocess.run call should pipe CLAUDE_CODE_AUTH_TOKEN via stdin
+        second_call = mock_run.call_args_list[1]
+        assert second_call[1]["input"] == "sk-ant-test"

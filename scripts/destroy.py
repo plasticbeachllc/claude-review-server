@@ -69,6 +69,8 @@ def delete_dns_record(config: dict):
         print("  No matching DNS record found (already deleted?)")
         return
 
+    if len(records) > 1:
+        print(f"  Warning: found {len(records)} CNAME records for {hostname}, deleting all")
     for record in records:
         cf_request("DELETE", f"/zones/{zone}/dns_records/{record['id']}", token)
         print(f"  Deleted DNS record {record['id']} ({hostname})")

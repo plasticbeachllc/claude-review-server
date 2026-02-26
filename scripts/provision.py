@@ -159,18 +159,22 @@ def inject_auth(ip: str, config: dict):
         )
 
     # Claude Code auth — upsert token in the service env file.
-    # Token is read via stdin into a shell variable so it never appears in
-    # process args (/proc/*/cmdline).  sed and echo run inside the same SSH
-    # shell session on a single-tenant server.
+    # Token is piped via stdin to a Python one-liner that reads it with
+    # sys.stdin and writes to the .env file.  This avoids sed metacharacter
+    # issues (|, &, \ in the token would silently corrupt a sed replacement)
+    # and never exposes the token in process args (/proc/*/cmdline).
     print("  Injecting Claude Code auth token...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
-         "TOKEN=$(cat) && "
-         "if grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env; then "
-         "  sed -i \"s|^CLAUDE_CODE_AUTH_TOKEN=.*|CLAUDE_CODE_AUTH_TOKEN=${TOKEN}|\" /opt/pr-review/.env; "
-         "else "
-         "  echo \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env; "
-         "fi"],
+         "python3 -c \""
+         "import sys, pathlib; "
+         "t = sys.stdin.read().strip(); "
+         "p = pathlib.Path('/opt/pr-review/.env'); "
+         "lines = [l for l in p.read_text().splitlines() "
+         "if not l.startswith('CLAUDE_CODE_AUTH_TOKEN=')]; "
+         "lines.append('CLAUDE_CODE_AUTH_TOKEN=' + t); "
+         "p.write_text('\\\\n'.join(lines) + '\\\\n')"
+         "\""],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
         capture_output=True, text=True, timeout=30,
     )
@@ -199,6 +203,15 @@ def setup_tunnel(config: dict, server_ip: str, created: dict | None = None) -> s
     zone = config["CF_ZONE_ID"]
     hostname = config["TUNNEL_HOSTNAME"]
     tunnel_name = config.get("SERVER_NAME", "pr-review")
+
+    # Validate hostname belongs to the configured zone
+    zone_data = cf_request("GET", f"/zones/{zone}", token)
+    zone_name = zone_data.get("result", {}).get("name", "")
+    if zone_name and not hostname.endswith(f".{zone_name}") and hostname != zone_name:
+        raise ProvisionError(
+            f"TUNNEL_HOSTNAME '{hostname}' does not belong to zone '{zone_name}' "
+            f"(CF_ZONE_ID={zone}). Check your .env configuration."
+        )
 
     # 1. Create tunnel (or reuse existing)
     existing = cf_request(

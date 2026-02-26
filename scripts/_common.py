@@ -216,6 +216,9 @@ def cf_request(method: str, path: str, token: str, **kwargs) -> dict:
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         timeout=30, **kwargs,
     )
+    # 204 No Content has no body — return a synthetic success response.
+    if resp.status_code == 204:
+        return {"success": True, "result": None}
     try:
         data = resp.json()
     except (ValueError, requests.exceptions.JSONDecodeError):
