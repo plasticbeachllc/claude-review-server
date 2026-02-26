@@ -369,6 +369,22 @@ class TestCollapseOldReviews:
 # ── review_pr ───────────────────────────────────────────
 
 
+def _find_call(mock_run, keyword):
+    """Find a subprocess.run call whose first arg contains the given keyword."""
+    return next(
+        (c for c in mock_run.call_args_list if keyword in c[0][0]),
+        None,
+    )
+
+
+def _find_call_with_body(mock_run):
+    """Find a subprocess.run call that includes '--body' (the comment post)."""
+    return next(
+        (c for c in mock_run.call_args_list if "--body" in c[0][0]),
+        None,
+    )
+
+
 class TestReviewPr:
     """Tests for the main review_pr orchestration function."""
 
@@ -393,8 +409,8 @@ class TestReviewPr:
         # Should have called: already_reviewed, diff, body, claude, comment
         assert mock_run.call_count == 5
         # Verify claude was called with the prompt
-        claude_call = mock_run.call_args_list[3]
-        assert "claude" in claude_call[0][0][0]
+        claude_call = _find_call(mock_run, "claude")
+        assert claude_call is not None
 
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
@@ -425,10 +441,10 @@ class TestReviewPr:
         review_pr("owner/repo", 2, "Update feature", "synchronize")
 
         # First call should be the collapse_old_reviews (gh api), not already_reviewed
-        first_args = mock_run.call_args_list[0][0][0]
-        assert "api" in first_args
+        assert _find_call(mock_run, "api") is not None
         # Verify "Updated Review" header in posted comment
-        comment_call = mock_run.call_args_list[4]
+        comment_call = _find_call_with_body(mock_run)
+        assert comment_call is not None
         comment_args = comment_call[0][0]
         body_idx = comment_args.index("--body") + 1
         assert "Updated Review" in comment_args[body_idx]
@@ -531,8 +547,7 @@ class TestReviewPr:
         review_pr("owner/repo", 1, "Fix {something}", "opened")
 
         # Verify claude was called (format didn't crash)
-        claude_call = mock_run.call_args_list[3]
-        assert "claude" in claude_call[0][0][0]
+        assert _find_call(mock_run, "claude") is not None
 
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
@@ -547,7 +562,9 @@ class TestReviewPr:
 
         review_pr("owner/repo", 1, "Fix", "opened")
 
-        comment_args = mock_run.call_args_list[4][0][0]
+        comment_call = _find_call_with_body(mock_run)
+        assert comment_call is not None
+        comment_args = comment_call[0][0]
         body_idx = comment_args.index("--body") + 1
         assert "Review" in comment_args[body_idx]  # "📝 Review" header
         assert "Updated" not in comment_args[body_idx]
@@ -682,7 +699,7 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        # Give the handler a moment to process
+        # executor.submit() is called synchronously inside do_POST
         mock_executor.submit.assert_called_once()
         call_args = mock_executor.submit.call_args
         assert call_args[0][0] == review_pr
@@ -746,30 +763,16 @@ class TestWebhookHandlerPost:
         mock_executor.submit.assert_not_called()
 
     def test_oversized_payload_returns_413(self, http_server):
-        import urllib.request
-        import urllib.error
-        host, port = http_server
-        # Create a payload > 5MB
-        payload = b"x" * (5_000_001)
-        req = urllib.request.Request(
-            f"http://{host}:{port}/webhook",
-            data=payload,
-            method="POST",
-            headers={
-                "Content-Length": str(len(payload)),
-                "X-Hub-Signature-256": "sha256=dummy",
-            },
-        )
-        # Server closes connection after reading Content-Length header,
-        # which may cause BrokenPipe on the client side or return 413.
-        try:
-            resp = urllib.request.urlopen(req)
-            assert resp.status == 413
-        except urllib.error.HTTPError as e:
-            assert e.code == 413
-        except (urllib.error.URLError, ConnectionError, BrokenPipeError):
-            # Server rejected before client finished sending — acceptable
-            pass
+        # Use a small payload with a lying Content-Length header to avoid
+        # actually sending 5MB over the wire. The server checks the header
+        # value before reading the body, so this reliably triggers 413.
+        payload = b"x" * 1024
+        headers = {
+            "Content-Length": "5000001",
+            "X-Hub-Signature-256": "sha256=dummy",
+        }
+        status, _ = self._post(http_server, "/webhook", payload, headers)
+        assert status == 413
 
     @patch("agent.executor")
     def test_missing_event_header_returns_200_no_submit(self, mock_executor, http_server):
