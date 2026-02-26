@@ -8,6 +8,7 @@ Exit codes:
     0 — server running and healthy
     1 — server exists but not running (e.g. off, starting)
     2 — server running but unhealthy (service down or health check failed)
+    3 — server not found (not provisioned)
 
 Usage:
     python3 scripts/status.py
@@ -38,7 +39,7 @@ def main():
 
     if not server:
         print(f"Server '{name}' not found on Hetzner (not provisioned).")
-        return
+        sys.exit(3)  # exit 3 = not found
 
     ip = server.public_net.ipv4.ip
     print(f"Server:   {name} (id={server.id})")

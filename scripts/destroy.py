@@ -37,24 +37,26 @@ def delete_webhook(config: dict):
         headers=headers, params={"per_page": 100},
     )
 
-    for hook in hooks:
-        hook_url = hook.get("config", {}).get("url", "")
-        if hook_url == target_url:
-            del_resp = requests.delete(
-                f"{GH_API}/orgs/{org}/hooks/{hook['id']}",
-                headers=headers, timeout=30,
-            )
-            if del_resp.status_code == 204:
-                print(f"  Deleted webhook {hook['id']}")
-            elif del_resp.status_code == 404:
-                print(f"  Webhook {hook['id']} already deleted (404)")
-            else:
-                raise ProvisionError(
-                    f"Webhook delete failed ({del_resp.status_code}): {del_resp.text}"
-                )
-            return
+    matching = [h for h in hooks if h.get("config", {}).get("url", "") == target_url]
+    if not matching:
+        print("  No matching webhook found (already deleted?)")
+        return
 
-    print("  No matching webhook found (already deleted?)")
+    if len(matching) > 1:
+        print(f"  Warning: found {len(matching)} webhooks for {target_url}, deleting all")
+    for hook in matching:
+        del_resp = requests.delete(
+            f"{GH_API}/orgs/{org}/hooks/{hook['id']}",
+            headers=headers, timeout=30,
+        )
+        if del_resp.status_code == 204:
+            print(f"  Deleted webhook {hook['id']}")
+        elif del_resp.status_code == 404:
+            print(f"  Webhook {hook['id']} already deleted (404)")
+        else:
+            raise ProvisionError(
+                f"Webhook delete failed ({del_resp.status_code}): {del_resp.text}"
+            )
 
 
 def delete_dns_record(config: dict):

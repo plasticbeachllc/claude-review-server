@@ -53,7 +53,11 @@ from destroy import (  # noqa: E402
 # SSH key management
 # ---------------------------------------------------------------------------
 def find_local_pubkey() -> str:
-    """Find the user's SSH public key. Returns the public key content."""
+    """Find the user's SSH public key. Returns the public key content.
+
+    Checks standard file paths first, then falls back to the SSH agent
+    (``ssh-add -L``) for users with keys stored under non-standard paths.
+    """
     candidates = [
         Path.home() / ".ssh" / "id_ed25519.pub",
         Path.home() / ".ssh" / "id_ecdsa.pub",
@@ -62,9 +66,21 @@ def find_local_pubkey() -> str:
     for path in candidates:
         if path.exists():
             return path.read_text().strip()
+
+    # Fallback: check SSH agent for loaded keys
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-L"], capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Use the first key from the agent
+            return result.stdout.strip().splitlines()[0]
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
     raise ProvisionError(
         "No SSH public key found. Expected ~/.ssh/id_ed25519.pub, "
-        "~/.ssh/id_ecdsa.pub, or ~/.ssh/id_rsa.pub"
+        "~/.ssh/id_ecdsa.pub, or ~/.ssh/id_rsa.pub — or a key loaded in ssh-agent"
     )
 
 
@@ -193,9 +209,11 @@ def inject_auth(ip: str, config: dict):
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
          "TOKEN=$(cat) && "
-         "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > /tmp/.env.new && "
-         "mv /tmp/.env.new /opt/pr-review/.env && "
-         "echo \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"],
+         "TMPFILE=$(mktemp) && "
+         "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > \"$TMPFILE\" && "
+         "mv \"$TMPFILE\" /opt/pr-review/.env && "
+         "chmod 600 /opt/pr-review/.env && "
+         "printf '%s\\n' \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
         capture_output=True, text=True, timeout=30,
     )
