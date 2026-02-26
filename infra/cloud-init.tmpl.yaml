@@ -70,9 +70,9 @@ write_files:
       # Security hardening
       NoNewPrivileges=yes
       ProtectSystem=strict
-      ReadWritePaths=/opt/pr-review
+      ReadWritePaths=/opt/pr-review /home/review
       PrivateTmp=yes
-      ProtectHome=no              # Claude auth tokens live in ~review/.claude/
+      ProtectHome=no              # gh config + Claude auth tokens live in ~review/
       ProtectKernelTunables=yes
       ProtectKernelModules=yes
       ProtectControlGroups=yes
@@ -89,7 +89,7 @@ runcmd:
   # ── Install Node.js (for Claude Code) ─────────────────────
   - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   - apt-get install -y nodejs
-  - npm install -g @anthropic-ai/claude-code@2.1.53
+  - npm install -g @anthropic-ai/claude-code@latest
 
   # ── Install GitHub CLI ────────────────────────────────────
   - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg

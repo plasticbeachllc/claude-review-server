@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -450,6 +451,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
 
@@ -478,6 +480,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"status":"healthy"}')
         else:
@@ -492,6 +495,15 @@ if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
     port = int(os.environ.get("PORT", "8080"))
     server = HTTPServer(("127.0.0.1", port), WebhookHandler)
+
+    def _shutdown(signum, frame):
+        log.info(f"Received signal {signum}, shutting down...")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     log.info(f"PR Review Agent listening on 127.0.0.1:{port} "
              f"(workers={MAX_WORKERS})")
     server.serve_forever()
