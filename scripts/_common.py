@@ -153,7 +153,8 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
             status = data.get("status", "")
             if status in ("done", "degraded"):
                 if status == "degraded":
-                    print(" degraded (some modules failed, continuing)")
+                    print(f" degraded (some modules failed)")
+                    print(f"  Warning: cloud-init degraded — check: ssh root@{ip} cloud-init status --long")
                 else:
                     print(" done")
                 return
@@ -173,10 +174,7 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
         except (ProvisionError, subprocess.TimeoutExpired, json.JSONDecodeError):
             pass  # transient SSH failures or parse errors — keep polling
         print(".", end="", flush=True)
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(10, remaining))
+        time.sleep(min(10, max(0, deadline - time.time())))
     raise ProvisionError(f"cloud-init did not finish within {timeout}s")
 
 

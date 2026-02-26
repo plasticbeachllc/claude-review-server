@@ -774,8 +774,8 @@ class TestWaitForCloudInit:
         from _common import ProvisionError, wait_for_cloud_init
 
         mock_ssh.return_value = json.dumps({"status": "running"})
-        # time() returns: start, first check (still in window), second check (past deadline)
-        mock_time.side_effect = [0, 1, 601]
+        # time() returns: deadline calc, while-check, sleep duration calc, while-check (past)
+        mock_time.side_effect = [0, 1, 1, 601]
 
         with pytest.raises(ProvisionError, match="cloud-init did not finish"):
             wait_for_cloud_init("1.2.3.4", timeout=600)

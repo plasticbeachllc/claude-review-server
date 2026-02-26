@@ -73,8 +73,12 @@ def find_local_pubkey() -> str:
             ["ssh-add", "-L"], capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            # Use the first key from the agent
-            return result.stdout.strip().splitlines()[0]
+            key_line = result.stdout.strip().splitlines()[0]
+            # Show which key was selected so the user can verify
+            parts = key_line.split()
+            key_comment = parts[2] if len(parts) >= 3 else "(no comment)"
+            print(f"  Using SSH key from agent: {parts[0]} {key_comment}")
+            return key_line
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
@@ -99,8 +103,11 @@ def _local_key_fingerprint(pubkey_content: str) -> str:
     return result.stdout.split()[1].removeprefix("MD5:")
 
 
-def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review") -> SSHKey:
+def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review") -> tuple[SSHKey, bool]:
     """Find or create the SSH key on Hetzner (matched by fingerprint).
+
+    Returns ``(key, was_created)`` — the bool indicates whether the key was
+    newly created (True) or already existed and was reused (False).
 
     Compares cryptographic fingerprints rather than raw key text so that
     differing comment fields (e.g. ``user@newhost`` vs ``user@oldhost``)
@@ -109,14 +116,14 @@ def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review")
     try:
         key = client.ssh_keys.create(name=name, public_key=pubkey_content)
         print(f"  Created SSH key '{name}' on Hetzner")
-        return key
+        return key, True
     except APIException as e:
         if e.code == "uniqueness_error":
             local_fp = _local_key_fingerprint(pubkey_content)
             for key in client.ssh_keys.get_all():
                 if key.fingerprint == local_fp:
                     print(f"  Reusing SSH key '{key.name}' on Hetzner")
-                    return key
+                    return key, False
             # Name collision with a different key
             raise ProvisionError(
                 f"SSH key named '{name}' already exists on Hetzner but doesn't match "
@@ -156,7 +163,13 @@ def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str
     # Wait for Hetzner to report it as running
     print("  Waiting for server status 'running'...", end="", flush=True)
     for _ in range(60):
-        server = client.servers.get_by_id(server.id)
+        try:
+            server = client.servers.get_by_id(server.id)
+        except APIException:
+            # Transient API error — keep polling
+            print(".", end="", flush=True)
+            time.sleep(5)
+            continue
         if server.status == "running":
             print(" ok")
             return server
@@ -213,7 +226,8 @@ def inject_auth(ip: str, config: dict):
          "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > \"$TMPFILE\" && "
          "mv \"$TMPFILE\" /opt/pr-review/.env && "
          "chmod 600 /opt/pr-review/.env && "
-         "printf '%s\\n' \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"],
+         "printf 'CLAUDE_CODE_AUTH_TOKEN=%s\\n' \"${TOKEN}\" >> /opt/pr-review/.env && "
+         "grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
         capture_output=True, text=True, timeout=30,
     )
@@ -468,8 +482,9 @@ def main():
         print("[3/8] Setting up SSH key...")
         pubkey = find_local_pubkey()
         client = Client(token=config["HCLOUD_TOKEN"])
-        ssh_key = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
-        created["ssh_key"] = ssh_key.name
+        ssh_key, key_created = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
+        if key_created:
+            created["ssh_key"] = ssh_key.name
 
         # 4. Create server
         print("[4/8] Creating Hetzner server...")
