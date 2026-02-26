@@ -13,6 +13,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import quote
 
 # ── Structured JSON logging ──────────────────────────────
 class JSONFormatter(logging.Formatter):
@@ -36,6 +37,7 @@ log = logging.getLogger("pr-review")
 WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]  # tests must set before import
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
+MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
@@ -129,6 +131,117 @@ def smart_truncate_diff(diff: str, max_chars: int = 40_000) -> tuple[str, str]:
     return "".join(kept), note
 
 
+def extract_diff_filenames(diff: str) -> list[str]:
+    """Extract unique filenames from a unified diff, excluding deleted files."""
+    filenames: list[str] = []
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        m = DIFF_HEADER_RE.match(lines[i])
+        if m:
+            filename = m.group(2)
+            # Check next few lines for "deleted file mode" or "+++ /dev/null"
+            is_deleted = False
+            for j in range(i + 1, min(i + 6, len(lines))):
+                if lines[j].startswith("diff --git"):
+                    break
+                if "deleted file mode" in lines[j] or lines[j] == "+++ /dev/null":
+                    is_deleted = True
+                    break
+            if not is_deleted and filename not in filenames:
+                filenames.append(filename)
+        i += 1
+    return filenames
+
+
+def format_file_contents(
+    files: list[tuple[str, str]], max_chars: int = 80_000,
+) -> tuple[str, str]:
+    """Format file contents with priority-based truncation.
+
+    Returns (formatted_contents, truncation_note).
+
+    Note: the is_low_priority sort is intentionally kept even though
+    fetch_file_contents already filters low-priority files. This makes
+    format_file_contents safe for standalone use with arbitrary inputs.
+    """
+    if not files:
+        return "", ""
+
+    # Sort: high-priority first, then smaller files first (defensive —
+    # callers may pass unfiltered file lists)
+    sorted_files = sorted(files, key=lambda x: (is_low_priority(x[0]), len(x[1])))
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    total = 0
+    for name, content in sorted_files:
+        entry = f"### {name}\n~~~\n{content}\n~~~\n"
+        if total + len(entry) <= max_chars:
+            kept.append(entry)
+            total += len(entry)
+        else:
+            dropped.append(name)
+
+    note = ""
+    if dropped:
+        note = (
+            f"({len(dropped)} file(s) contents omitted: "
+            f"{', '.join(dropped[:10])}"
+            f"{'...' if len(dropped) > 10 else ''})"
+        )
+
+    return "".join(kept), note
+
+
+def fetch_file_contents(
+    repo: str, head_sha: str, filenames: list[str],
+) -> list[tuple[str, str]]:
+    """Fetch full file contents from the PR head ref via GitHub API.
+
+    Skips low-priority, binary, and oversized (>50 KB) files.
+    Fetches at most 15 files to limit API calls.
+    """
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        log.warning(f"Invalid repo format: {repo!r}")
+        return []
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        log.warning(f"Invalid head SHA format: {head_sha!r}")
+        return []
+
+    targets = [f for f in filenames if not is_low_priority(f)][:15]
+    files: list[tuple[str, str]] = []
+
+    for filename in targets:
+        encoded_path = quote(filename, safe="/")
+        # capture_output without text=True is intentional: we need raw
+        # bytes to detect binary content (null-byte check) before
+        # decoding as UTF-8.
+        result = subprocess.run(
+            ["gh", "api",
+             f"repos/{repo}/contents/{encoded_path}?ref={head_sha}",
+             "-H", "Accept: application/vnd.github.raw+json"],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            log.debug(f"Failed to fetch {filename} (rc={result.returncode})")
+            continue
+        # Decode as UTF-8; null bytes are a strong binary signal
+        content = result.stdout.decode("utf-8", errors="replace")
+        if not content:
+            log.debug(f"Skipping empty file: {filename}")
+            continue
+        if "\x00" in content[:8192]:
+            log.debug(f"Skipping binary file: {filename}")
+            continue
+        if len(content) > 50_000:
+            log.debug(f"Skipping oversized file ({len(content)} chars): {filename}")
+            continue
+        files.append((filename, content))
+
+    return files
+
+
 def already_reviewed(repo: str, pr_number: int) -> bool:
     """Check if we already posted a review comment on this PR."""
     result = subprocess.run(
@@ -204,18 +317,55 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             log.error(f"gh pr diff failed: {diff_result.stderr}")
             return
 
-        body_result = subprocess.run(
+        # Fetch PR metadata (body + head SHA) in one call
+        pr_info_result = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--repo", repo,
-             "--json", "body", "--jq", ".body"],
+             "--json", "body,headRefOid"],
             capture_output=True, text=True, timeout=30,
         )
-        pr_body = body_result.stdout.strip() if body_result.returncode == 0 else ""
+        pr_body = ""
+        head_sha = ""
+        if pr_info_result.returncode == 0:
+            try:
+                pr_info = json.loads(pr_info_result.stdout)
+                pr_body = pr_info.get("body", "").strip()
+                head_sha = pr_info.get("headRefOid", "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
 
         diff, truncation_note = smart_truncate_diff(diff_result.stdout)
 
         if not diff.strip():
             log.warning(f"Empty diff for {repo}#{pr_number}")
             return
+
+        # Fetch full contents of changed files for richer context
+        file_section = ""
+        if head_sha:
+            filenames = extract_diff_filenames(diff_result.stdout)
+            fetchable = [f for f in filenames if not is_low_priority(f)]
+            raw_files = fetch_file_contents(repo, head_sha, fetchable)
+            file_contents_str, file_note = format_file_contents(
+                raw_files, max_chars=MAX_FILE_CHARS,
+            )
+            # Surface the 15-file fetch cap if it was hit
+            notes = []
+            capped = len(fetchable) - 15
+            if capped > 0:
+                names = ", ".join(fetchable[15:25])
+                suffix = "..." if capped > 10 else ""
+                notes.append(
+                    f"({capped} file(s) exceeded 15-file fetch limit: "
+                    f"{names}{suffix})"
+                )
+            if file_note:
+                notes.append(file_note)
+
+            if file_contents_str:
+                parts = ["Full contents of changed files for context:"]
+                parts.extend(notes)
+                parts.append(file_contents_str)
+                file_section = "\n\n".join(parts)
 
         # Escape braces in untrusted content so .format() doesn't choke
         # on diffs/bodies containing {variable_name} patterns.
@@ -228,8 +378,11 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             pr_title=esc(pr_title),
             pr_body=esc(pr_body) or "(none)",
             truncation_note=truncation_note,
+            file_contents=esc(file_section),
             diff=esc(diff),
         )
+        # Collapse runs of blank lines left by empty placeholders
+        prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],

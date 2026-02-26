@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import subprocess
+import textwrap
 from http.server import HTTPServer
 from threading import Thread
 from unittest.mock import patch
@@ -19,6 +20,9 @@ from agent import (
     WebhookHandler,
     already_reviewed,
     collapse_old_reviews,
+    extract_diff_filenames,
+    fetch_file_contents,
+    format_file_contents,
     is_low_priority,
     review_pr,
     smart_truncate_diff,
@@ -169,6 +173,442 @@ class TestSmartTruncateDiff:
         result, note = smart_truncate_diff(diff, max_chars=len(diff))
         assert result == diff
         assert note == ""
+
+
+# ── extract_diff_filenames ───────────────────────────────
+
+
+class TestExtractDiffFilenames:
+    def test_extracts_modified_files(self):
+        diff = textwrap.dedent("""\
+            diff --git a/src/main.py b/src/main.py
+            index abc..def 100644
+            --- a/src/main.py
+            +++ b/src/main.py
+            @@ -1,3 +1,4 @@
+            +import os
+             import sys
+            diff --git a/src/utils.py b/src/utils.py
+            index abc..def 100644
+            --- a/src/utils.py
+            +++ b/src/utils.py
+            @@ -10,3 +10,4 @@
+            +# comment
+        """)
+        assert extract_diff_filenames(diff) == ["src/main.py", "src/utils.py"]
+
+    def test_excludes_deleted_files(self):
+        diff = textwrap.dedent("""\
+            diff --git a/keep.py b/keep.py
+            index abc..def 100644
+            --- a/keep.py
+            +++ b/keep.py
+            @@ -1 +1,2 @@
+            +new line
+            diff --git a/removed.py b/removed.py
+            deleted file mode 100644
+            index abc..000
+            --- a/removed.py
+            +++ /dev/null
+            @@ -1,5 +0,0 @@
+            -old content
+        """)
+        result = extract_diff_filenames(diff)
+        assert "keep.py" in result
+        assert "removed.py" not in result
+
+    def test_excludes_dev_null_deletions(self):
+        diff = textwrap.dedent("""\
+            diff --git a/gone.py b/gone.py
+            index abc..000
+            --- a/gone.py
+            +++ /dev/null
+            @@ -1 +0,0 @@
+            -bye
+        """)
+        assert extract_diff_filenames(diff) == []
+
+    def test_handles_new_files(self):
+        diff = textwrap.dedent("""\
+            diff --git a/new.py b/new.py
+            new file mode 100644
+            index 000..abc
+            --- /dev/null
+            +++ b/new.py
+            @@ -0,0 +1,3 @@
+            +hello
+        """)
+        assert extract_diff_filenames(diff) == ["new.py"]
+
+    def test_handles_renames(self):
+        diff = textwrap.dedent("""\
+            diff --git a/old_name.py b/new_name.py
+            similarity index 95%
+            rename from old_name.py
+            rename to new_name.py
+            index abc..def 100644
+            --- a/old_name.py
+            +++ b/new_name.py
+            @@ -1 +1 @@
+            -old
+            +new
+        """)
+        assert extract_diff_filenames(diff) == ["new_name.py"]
+
+    def test_no_duplicates(self):
+        # Same file appearing somehow won't duplicate
+        diff = (
+            "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n+x\n"
+        )
+        assert extract_diff_filenames(diff) == ["f.py"]
+
+    def test_empty_diff(self):
+        assert extract_diff_filenames("") == []
+
+    def test_diff_header_as_last_line(self):
+        """diff --git line at EOF with no subsequent lines."""
+        diff = "diff --git a/trailing.py b/trailing.py"
+        assert extract_diff_filenames(diff) == ["trailing.py"]
+
+    def test_diff_header_only_one_line_after(self):
+        """diff --git with only an index line following (no +++ line)."""
+        diff = (
+            "diff --git a/mode.py b/mode.py\n"
+            "index abc..def 100755\n"
+        )
+        assert extract_diff_filenames(diff) == ["mode.py"]
+
+
+# ── format_file_contents ────────────────────────────────
+
+
+class TestFormatFileContents:
+    def test_formats_files(self):
+        files = [("src/main.py", "import os\n")]
+        result, note = format_file_contents(files, max_chars=10_000)
+        assert "### src/main.py" in result
+        assert "import os" in result
+        assert note == ""
+
+    def test_truncates_large_files(self):
+        files = [
+            ("small.py", "x" * 100),
+            ("big.py", "y" * 5000),
+        ]
+        result, note = format_file_contents(files, max_chars=200)
+        assert "small.py" in result
+        assert "big.py" not in result
+        assert "1 file(s) contents omitted" in note
+        assert "big.py" in note
+
+    def test_drops_low_priority_first(self):
+        files = [
+            ("src/app.py", "x" * 300),
+            ("package-lock.json", "y" * 300),
+        ]
+        result, note = format_file_contents(files, max_chars=400)
+        assert "src/app.py" in result
+        assert "package-lock.json" not in result
+
+    def test_empty_input(self):
+        result, note = format_file_contents([], max_chars=10_000)
+        assert result == ""
+        assert note == ""
+
+    def test_note_caps_at_10_names(self):
+        files = [(f"f{i}.py", "x" * 100) for i in range(15)]
+        _, note = format_file_contents(files, max_chars=200)
+        assert "..." in note
+
+    def test_all_files_fit(self):
+        files = [
+            ("a.py", "aaa"),
+            ("b.py", "bbb"),
+        ]
+        result, note = format_file_contents(files, max_chars=100_000)
+        assert "a.py" in result
+        assert "b.py" in result
+        assert note == ""
+
+    def test_exact_boundary(self):
+        """A single file whose formatted entry exactly hits max_chars."""
+        files = [("x.py", "hello")]
+        entry = "### x.py\n~~~\nhello\n~~~\n"
+        result, note = format_file_contents(files, max_chars=len(entry))
+        assert result == entry
+        assert note == ""
+
+    def test_single_file_too_large(self):
+        """One file exceeds budget — result is empty, note lists it."""
+        files = [("huge.py", "x" * 10_000)]
+        result, note = format_file_contents(files, max_chars=50)
+        assert result == ""
+        assert "huge.py" in note
+        assert "1 file(s) contents omitted" in note
+
+    def test_all_dropped(self):
+        """Multiple files, all too large — every file dropped."""
+        files = [
+            ("a.py", "x" * 500),
+            ("b.py", "y" * 500),
+        ]
+        result, note = format_file_contents(files, max_chars=10)
+        assert result == ""
+        assert "2 file(s) contents omitted" in note
+
+    def test_mixed_priority_under_pressure(self):
+        """High-priority small file kept; low-priority file and large high-priority dropped."""
+        files = [
+            ("src/small.py", "x" * 50),
+            ("package-lock.json", "y" * 50),
+            ("src/big.py", "z" * 5000),
+        ]
+        # Budget fits only one small file (~76 chars formatted)
+        result, note = format_file_contents(files, max_chars=100)
+        assert "src/small.py" in result
+        assert "package-lock.json" not in result
+        assert "src/big.py" not in result
+        assert "2 file(s) contents omitted" in note
+
+    def test_output_wraps_in_code_blocks(self):
+        """Each file gets a markdown header and tilde-fenced code block."""
+        files = [("app.py", "print('hi')")]
+        result, _ = format_file_contents(files, max_chars=10_000)
+        assert result.startswith("### app.py\n~~~\n")
+        assert result.endswith("\n~~~\n")
+
+    def test_no_double_blank_lines_between_files(self):
+        """Multiple files are joined without extra blank lines."""
+        files = [
+            ("a.py", "aaa"),
+            ("b.py", "bbb"),
+        ]
+        result, _ = format_file_contents(files, max_chars=100_000)
+        # Each entry ends with \n, so joining directly gives \n###
+        # There should be no \n\n### (double blank line) between entries
+        assert "\n\n###" not in result
+        assert "### a.py" in result
+        assert "### b.py" in result
+
+
+# ── fetch_file_contents ─────────────────────────────────
+
+
+class TestFetchFileContents:
+    """Tests for fetch_file_contents filter logic (mocked subprocess)."""
+
+    VALID_SHA = "a" * 40  # valid 40-char hex SHA
+
+    def _make_run(self, responses: dict[str, bytes]):
+        """Return a fake subprocess.run that returns bytes content keyed by filename."""
+        class FakeResult:
+            def __init__(self, stdout, returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+                self.stderr = b""
+
+        def fake_run(cmd, **kwargs):
+            # Extract filename from the gh api URL:
+            #   repos/{repo}/contents/{path}?ref={sha}
+            url = cmd[2]  # "repos/owner/repo/contents/path?ref=sha"
+            path_part = url.split("/contents/")[1].split("?")[0]
+            if path_part in responses:
+                return FakeResult(responses[path_part])
+            return FakeResult(b"", returncode=1)
+
+        return fake_run
+
+    def test_skips_low_priority_files(self, monkeypatch):
+        fake = self._make_run({"package-lock.json": b"{}", "app.py": b"code"})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["package-lock.json", "app.py"])
+        names = [name for name, _ in result]
+        assert "app.py" in names
+        assert "package-lock.json" not in names
+
+    def test_caps_at_15_files(self, monkeypatch):
+        all_files = [f"file{i}.py" for i in range(20)]
+        responses = {f: f"content_{f}".encode() for f in all_files}
+        fake = self._make_run(responses)
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, all_files)
+        assert len(result) == 15
+
+    def test_skips_api_failures(self, monkeypatch):
+        fake = self._make_run({})  # all files return rc=1
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["missing.py"])
+        assert result == []
+
+    def test_skips_empty_content(self, monkeypatch):
+        fake = self._make_run({"empty.py": b""})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["empty.py"])
+        assert result == []
+
+    def test_skips_oversized_files(self, monkeypatch):
+        fake = self._make_run({"huge.py": b"x" * 60_000})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["huge.py"])
+        assert result == []
+
+    def test_skips_binary_files(self, monkeypatch):
+        fake = self._make_run({"image.py": b"header\x00binary_data"})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["image.py"])
+        assert result == []
+
+    def test_passes_non_null_non_ascii_files(self, monkeypatch):
+        """Files with non-ASCII bytes but no null bytes are accepted (not false-positive)."""
+        # Valid UTF-8 with high bytes — should NOT be rejected
+        fake = self._make_run({"text.py": b"\xc3\xa9\xc3\xa0 unicode ok"})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["text.py"])
+        assert len(result) == 1
+        assert result[0][0] == "text.py"
+
+    def test_returns_valid_files(self, monkeypatch):
+        fake = self._make_run({"good.py": b"import os\nprint('hello')\n"})
+        monkeypatch.setattr("agent.subprocess.run", fake)
+        result = fetch_file_contents("owner/repo", self.VALID_SHA, ["good.py"])
+        assert len(result) == 1
+        assert result[0] == ("good.py", "import os\nprint('hello')\n")
+
+    def test_rejects_invalid_sha(self, monkeypatch):
+        """Invalid head_sha format returns empty list without making API calls."""
+        call_count = 0
+        def no_calls(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+        monkeypatch.setattr("agent.subprocess.run", no_calls)
+        result = fetch_file_contents("owner/repo", "not-a-sha", ["file.py"])
+        assert result == []
+        assert call_count == 0
+
+    def test_rejects_invalid_repo_format(self, monkeypatch):
+        """Malformed repo names (e.g. path traversal) are rejected without API calls."""
+        call_count = 0
+        def no_calls(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+        monkeypatch.setattr("agent.subprocess.run", no_calls)
+        # Path traversal attempt
+        result = fetch_file_contents("owner/../evil", self.VALID_SHA, ["file.py"])
+        assert result == []
+        assert call_count == 0
+        # Missing slash
+        result = fetch_file_contents("noslash", self.VALID_SHA, ["file.py"])
+        assert result == []
+        assert call_count == 0
+
+    def test_url_encodes_filenames(self, monkeypatch):
+        """Filenames with spaces/special chars are URL-encoded in the API call."""
+        captured_urls = []
+        class FakeResult:
+            stdout = b"content"
+            returncode = 0
+            stderr = b""
+        def capture_run(cmd, **kwargs):
+            captured_urls.append(cmd[2])
+            return FakeResult()
+        monkeypatch.setattr("agent.subprocess.run", capture_run)
+        fetch_file_contents("owner/repo", self.VALID_SHA, ["path/to/my file.py"])
+        assert len(captured_urls) == 1
+        assert "my%20file.py" in captured_urls[0]
+        assert "my file.py" not in captured_urls[0]
+
+
+# ── prompt template rendering ────────────────────────────
+
+
+class TestPromptRendering:
+    """Verify the prompt template renders correctly with all placeholders."""
+
+    def test_template_renders_with_file_contents(self):
+        from agent import get_prompt_template
+        template = get_prompt_template()
+
+        def esc(s):
+            return s.replace("{", "{{").replace("}", "}}")
+
+        # Should not raise KeyError for any placeholder
+        result = template.format(
+            pr_number=42,
+            repo="owner/repo",
+            pr_title=esc("Add feature"),
+            pr_body=esc("Implements X"),
+            truncation_note="",
+            file_contents=esc("### app.py\n~~~\nprint('hi')\n~~~\n"),
+            diff=esc("+import os\n"),
+        )
+        assert "PR #42" in result
+        assert "owner/repo" in result
+        assert "### app.py" in result
+        assert "+import os" in result
+
+    def test_template_renders_with_empty_file_contents(self):
+        from agent import get_prompt_template
+        template = get_prompt_template()
+
+        def esc(s):
+            return s.replace("{", "{{").replace("}", "}}")
+
+        result = template.format(
+            pr_number=1,
+            repo="a/b",
+            pr_title=esc("Fix"),
+            pr_body=esc("(none)"),
+            truncation_note="",
+            file_contents="",
+            diff=esc("+x\n"),
+        )
+        assert "a/b" in result
+        assert "+x" in result
+
+    def test_template_handles_braces_in_file_contents(self):
+        """File contents with { and } don't break .format()."""
+        from agent import get_prompt_template
+        template = get_prompt_template()
+
+        def esc(s):
+            return s.replace("{", "{{").replace("}", "}}")
+
+        code_with_braces = "def main():\n    d = {key: value}\n    return d\n"
+        result = template.format(
+            pr_number=1,
+            repo="a/b",
+            pr_title=esc("Fix"),
+            pr_body=esc("(none)"),
+            truncation_note="",
+            file_contents=esc(code_with_braces),
+            diff=esc("+x\n"),
+        )
+        assert "{key: value}" in result
+
+    def test_empty_placeholders_no_triple_blank_lines(self):
+        """Empty truncation_note and file_contents don't produce triple+ blank lines
+        after collapsing (as done in review_pr)."""
+        import re as re_mod
+        from agent import get_prompt_template
+        template = get_prompt_template()
+
+        def esc(s):
+            return s.replace("{", "{{").replace("}", "}}")
+
+        result = template.format(
+            pr_number=1,
+            repo="a/b",
+            pr_title=esc("Fix"),
+            pr_body=esc("(none)"),
+            truncation_note="",
+            file_contents="",
+            diff=esc("+x\n"),
+        )
+        # Simulate the same collapsing done in review_pr
+        result = re_mod.sub(r"\n{3,}", "\n\n", result)
+        assert "\n\n\n" not in result
+        # Content should still be present
+        assert "Diff (changes to review):" in result
 
 
 # ── build.py ─────────────────────────────────────────────
