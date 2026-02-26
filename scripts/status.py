@@ -89,7 +89,7 @@ def main():
         try:
             resp = requests.get(f"https://{hostname}/health", timeout=10)
             if resp.status_code == 200:
-                print(f"Tunnel:   reachable")
+                print("Tunnel:   reachable")
             else:
                 print(f"Tunnel:   HTTP {resp.status_code}")
                 healthy = False

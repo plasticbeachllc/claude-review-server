@@ -147,6 +147,15 @@ class TestLoadConfig:
         config = load_config(root)
         assert config["HCLOUD_TOKEN"] == "value # with hash"
 
+    def test_strips_export_prefix(self, tmp_path):
+        from _common import load_config
+
+        # Shell-compatible .env files may prefix lines with "export"
+        lines = self._full_env().replace("HCLOUD_TOKEN=", "export HCLOUD_TOKEN=")
+        root = self._write_env(tmp_path, lines)
+        config = load_config(root)
+        assert config["HCLOUD_TOKEN"] == "hc-test-token"
+
 
 # ── SSH key detection ──────────────────────────────────────
 
@@ -775,8 +784,8 @@ class TestWaitForCloudInit:
         from _common import ProvisionError, wait_for_cloud_init
 
         mock_ssh.return_value = json.dumps({"status": "running"})
-        # time() returns: deadline calc, while-check, sleep duration calc, while-check (past)
-        mock_time.side_effect = [0, 1, 1, 601]
+        # time() returns: deadline calc, while-check, while-check (past deadline)
+        mock_time.side_effect = [0, 1, 601]
 
         with pytest.raises(ProvisionError, match="cloud-init did not finish"):
             wait_for_cloud_init("1.2.3.4", timeout=600)
@@ -806,8 +815,8 @@ class TestWaitForCloudInit:
             ProvisionError("connection refused"),
             json.dumps({"status": "done"}),
         ]
-        # time() calls: deadline calc, while-check, remaining calc, while-check
-        mock_time.side_effect = [0, 1, 11, 15]
+        # time() calls: deadline calc, while-check, while-check
+        mock_time.side_effect = [0, 1, 15]
 
         wait_for_cloud_init("1.2.3.4", timeout=60)
 

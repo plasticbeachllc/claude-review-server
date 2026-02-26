@@ -47,6 +47,7 @@ SSH_OPTS = [
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "ConnectTimeout=10",
     "-o", "BatchMode=yes",
+    "-o", "LogLevel=ERROR",
 ]
 
 
@@ -78,6 +79,10 @@ def load_config(root: Path) -> dict:
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
+        key = key.strip()
+        # Support "export KEY=value" syntax common in shell-compatible .env files
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
         value = value.strip()
         # Strip surrounding quotes (single or double) — common .env convention
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
@@ -91,7 +96,7 @@ def load_config(root: Path) -> dict:
             comment_idx = value.find(" #")
             if comment_idx != -1:
                 value = value[:comment_idx].rstrip()
-        config[key.strip()] = value
+        config[key] = value
 
     # Apply defaults
     for key, default in DEFAULTS.items():
@@ -180,7 +185,7 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
         except (ProvisionError, subprocess.TimeoutExpired, json.JSONDecodeError):
             pass  # transient SSH failures or parse errors — keep polling
         print(".", end="", flush=True)
-        time.sleep(min(10, max(0, deadline - time.time())))
+        time.sleep(10)
     raise ProvisionError(f"cloud-init did not finish within {timeout}s")
 
 

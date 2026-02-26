@@ -135,8 +135,8 @@ def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review")
             # Name collision with a different key
             raise ProvisionError(
                 f"SSH key named '{name}' already exists on Hetzner but doesn't match "
-                f"your local public key. Delete it in the Hetzner console or use a "
-                f"different SERVER_NAME."
+                f"your local public key. Rename the existing SSH key in the Hetzner "
+                f"console (key is named after SERVER_NAME='{name}')."
             ) from e
         raise ProvisionError(f"Failed to create/find SSH key: {e}") from e
 
@@ -230,7 +230,7 @@ def inject_auth(ip: str, config: dict):
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
          "TOKEN=$(cat) && "
-         "TMPFILE=$(mktemp) && "
+         "TMPFILE=$(mktemp -p /opt/pr-review/) && "
          "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > \"$TMPFILE\" && "
          "chmod 600 \"$TMPFILE\" && "
          "mv \"$TMPFILE\" /opt/pr-review/.env && "
