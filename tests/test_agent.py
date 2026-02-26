@@ -2,14 +2,12 @@
 
 import hashlib
 import hmac
-import io
 import json
 import os
 import subprocess
-import textwrap
 from http.server import HTTPServer
 from threading import Thread
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
