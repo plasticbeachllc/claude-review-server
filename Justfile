@@ -30,6 +30,19 @@ setup-tls host cert key:
     ssh {{host}} 'chown caddy:caddy /etc/caddy/certs/origin.pem /etc/caddy/certs/origin-key.pem && chmod 644 /etc/caddy/certs/origin.pem && chmod 600 /etc/caddy/certs/origin-key.pem && ufw allow 443/tcp && caddy validate --config /etc/caddy/Caddyfile && systemctl restart caddy && systemctl is-active --quiet caddy'
     @echo "✓ TLS configured — Caddy now serving on :443"
 
+# Provision a new server (build + create + configure — fully automated)
+provision:
+    uv run python scripts/provision.py
+
+# Destroy the server and clean up tunnel/webhook/DNS (pass "yes" to confirm)
+destroy confirm="":
+    @[ "{{ confirm }}" = "yes" ] || (echo "This will delete the server and all associated resources."; echo "Run: just destroy yes"; exit 1)
+    uv run python scripts/destroy.py --yes
+
+# Check server status and health
+status:
+    uv run python scripts/status.py
+
 # Run tests
 test:
     uv run pytest tests/ -v

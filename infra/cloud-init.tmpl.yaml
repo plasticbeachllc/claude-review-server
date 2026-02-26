@@ -149,6 +149,21 @@ runcmd:
   - chown -R review:review /opt/pr-review
   - chmod 600 /opt/pr-review/.env
 
+  # ── Install cloudflared (via official apt repo — installs latest) ──
+  # Pre-installed for both automated (`just provision`) and manual tunnel setup.
+  # To activate: cloudflared service install <TUNNEL_TOKEN>
+  # Note: not version-pinned; pin with `cloudflared=<version>` if needed.
+  # GPG key hash pinned to guard against supply-chain tampering between
+  # key download and package install.  Update the hash if Cloudflare rotates
+  # their signing key (curl the URL and pipe through sha256sum).
+  - |
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /tmp/cloudflare-main.gpg
+    echo "1bd95f4082b320d541bee351560fc2765aa9f9cd8efa4c9e32135e63f252721d  /tmp/cloudflare-main.gpg" | sha256sum -c - \
+      || { echo "FATAL: cloudflared GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
+    mv /tmp/cloudflare-main.gpg /usr/share/keyrings/cloudflare-main.gpg
+  - echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
+  - apt-get update && apt-get install -y cloudflared
+
   # ── Firewall — only SSH ──────────────────────────────────
   # Port 80 is intentionally NOT opened: Caddy listens on :80 for the tunnel,
   # but cloudflared connects to it via localhost. No inbound ports needed.
