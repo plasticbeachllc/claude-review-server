@@ -193,7 +193,7 @@ def inject_auth(ip: str, config: dict):
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
          "TOKEN=$(cat) && "
-         "grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env > /tmp/.env.new && "
+         "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > /tmp/.env.new && "
          "mv /tmp/.env.new /opt/pr-review/.env && "
          "echo \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
@@ -228,7 +228,12 @@ def setup_tunnel(config: dict, server_ip: str, created: dict | None = None) -> s
     # Validate hostname belongs to the configured zone
     zone_data = cf_request("GET", f"/zones/{zone}", token)
     zone_name = zone_data.get("result", {}).get("name", "")
-    if zone_name and not hostname.endswith(f".{zone_name}") and hostname != zone_name:
+    if not zone_name:
+        raise ProvisionError(
+            f"Could not read zone name for CF_ZONE_ID={zone} — "
+            f"check that the zone ID is correct and the API token has access"
+        )
+    if not hostname.endswith(f".{zone_name}") and hostname != zone_name:
         raise ProvisionError(
             f"TUNNEL_HOSTNAME '{hostname}' does not belong to zone '{zone_name}' "
             f"(CF_ZONE_ID={zone}). Check your .env configuration."
@@ -394,7 +399,7 @@ def _auto_cleanup(created: dict, config: dict):
         return
     print("\nCleaning up partially created resources...", file=sys.stderr)
 
-    # Reverse order: webhook -> DNS -> tunnel -> server
+    # Reverse order: webhook -> DNS -> tunnel -> server -> SSH key
     cleanup_steps = []
     if "webhook" in created:
         cleanup_steps.append(("webhook", delete_webhook))
@@ -411,6 +416,17 @@ def _auto_cleanup(created: dict, config: dict):
             print(f"  Cleaned up {label}", file=sys.stderr)
         except Exception as e:
             print(f"  Warning: failed to clean up {label}: {e}", file=sys.stderr)
+
+    # SSH key cleanup — uses hcloud Client directly (not a destroy.py function)
+    if "ssh_key" in created:
+        try:
+            client = Client(token=config["HCLOUD_TOKEN"])
+            key = client.ssh_keys.get_by_name(created["ssh_key"])
+            if key:
+                client.ssh_keys.delete(key)
+                print(f"  Cleaned up SSH key '{created['ssh_key']}'", file=sys.stderr)
+        except Exception as e:
+            print(f"  Warning: failed to clean up SSH key: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +451,7 @@ def main():
         pubkey = find_local_pubkey()
         client = Client(token=config["HCLOUD_TOKEN"])
         ssh_key = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
+        created["ssh_key"] = ssh_key.name
 
         # 4. Create server
         print("[4/8] Creating Hetzner server...")

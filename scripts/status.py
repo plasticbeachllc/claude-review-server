@@ -4,6 +4,11 @@
 Reports server status from Hetzner and optionally checks the service health
 via SSH.
 
+Exit codes:
+    0 — server running and healthy
+    1 — server exists but not running (e.g. off, starting)
+    2 — server running but unhealthy (service down or health check failed)
+
 Usage:
     python3 scripts/status.py
     just status
@@ -52,7 +57,7 @@ def main():
 
     if server.status != "running":
         print(f"\nServer is '{server.status}', not running — skipping health checks.")
-        sys.exit(1)
+        sys.exit(1)  # exit 1 = not running
 
     # Check service health via SSH
     healthy = True
@@ -78,7 +83,7 @@ def main():
         healthy = False
 
     if not healthy:
-        sys.exit(1)
+        sys.exit(2)  # exit 2 = running but unhealthy
 
 
 if __name__ == "__main__":

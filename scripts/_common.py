@@ -151,8 +151,11 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
             out = ssh(ip, "cloud-init status --format json 2>/dev/null || echo '{}'", timeout=30)
             data = json.loads(out) if out else {}
             status = data.get("status", "")
-            if status == "done":
-                print(" done")
+            if status in ("done", "degraded"):
+                if status == "degraded":
+                    print(" degraded (some modules failed, continuing)")
+                else:
+                    print(" done")
                 return
             if status == "error":
                 detail = data.get("extended_status", data.get("status", "unknown"))

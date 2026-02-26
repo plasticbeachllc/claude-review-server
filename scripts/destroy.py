@@ -46,8 +46,12 @@ def delete_webhook(config: dict):
             )
             if del_resp.status_code == 204:
                 print(f"  Deleted webhook {hook['id']}")
+            elif del_resp.status_code == 404:
+                print(f"  Webhook {hook['id']} already deleted (404)")
             else:
-                print(f"  Warning: webhook delete returned {del_resp.status_code}")
+                raise ProvisionError(
+                    f"Webhook delete failed ({del_resp.status_code}): {del_resp.text}"
+                )
             return
 
     print("  No matching webhook found (already deleted?)")

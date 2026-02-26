@@ -846,10 +846,10 @@ class TestInjectAuth:
         from provision import inject_auth
 
         mock_ssh.return_value = "/usr/bin/gh"
-        # 2 subprocess.run calls: gh auth, sed upsert
+        # 2 subprocess.run calls: gh auth, grep/mv upsert
         mock_run.side_effect = [
             MagicMock(returncode=0, stderr="", stdout=""),  # gh auth login
-            MagicMock(returncode=0, stderr="", stdout=""),  # sed upsert
+            MagicMock(returncode=0, stderr="", stdout=""),  # grep/mv upsert
         ]
 
         inject_auth("1.2.3.4", self._config())  # should not raise
