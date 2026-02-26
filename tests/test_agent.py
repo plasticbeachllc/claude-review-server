@@ -21,6 +21,7 @@ from agent import (
     already_reviewed,
     collapse_old_reviews,
     extract_diff_filenames,
+    fetch_file_contents,
     format_file_contents,
     is_low_priority,
     review_pr,
@@ -418,7 +419,6 @@ class TestFetchFileContents:
         return fake_run
 
     def test_skips_low_priority_files(self, monkeypatch):
-        from agent import fetch_file_contents
         fake = self._make_run({"package-lock.json": b"{}", "app.py": b"code"})
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["package-lock.json", "app.py"])
@@ -427,7 +427,6 @@ class TestFetchFileContents:
         assert "package-lock.json" not in names
 
     def test_caps_at_15_files(self, monkeypatch):
-        from agent import fetch_file_contents
         all_files = [f"file{i}.py" for i in range(20)]
         responses = {f: f"content_{f}".encode() for f in all_files}
         fake = self._make_run(responses)
@@ -436,28 +435,24 @@ class TestFetchFileContents:
         assert len(result) == 15
 
     def test_skips_api_failures(self, monkeypatch):
-        from agent import fetch_file_contents
         fake = self._make_run({})  # all files return rc=1
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["missing.py"])
         assert result == []
 
     def test_skips_empty_content(self, monkeypatch):
-        from agent import fetch_file_contents
         fake = self._make_run({"empty.py": b""})
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["empty.py"])
         assert result == []
 
     def test_skips_oversized_files(self, monkeypatch):
-        from agent import fetch_file_contents
         fake = self._make_run({"huge.py": b"x" * 60_000})
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["huge.py"])
         assert result == []
 
     def test_skips_binary_files(self, monkeypatch):
-        from agent import fetch_file_contents
         fake = self._make_run({"image.py": b"header\x00binary_data"})
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["image.py"])
@@ -465,8 +460,7 @@ class TestFetchFileContents:
 
     def test_passes_non_null_non_ascii_files(self, monkeypatch):
         """Files with non-ASCII bytes but no null bytes are accepted (not false-positive)."""
-        from agent import fetch_file_contents
-        # PNG header without null bytes — should NOT be rejected
+        # Valid UTF-8 with high bytes — should NOT be rejected
         fake = self._make_run({"text.py": b"\xc3\xa9\xc3\xa0 unicode ok"})
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["text.py"])
@@ -474,7 +468,6 @@ class TestFetchFileContents:
         assert result[0][0] == "text.py"
 
     def test_returns_valid_files(self, monkeypatch):
-        from agent import fetch_file_contents
         fake = self._make_run({"good.py": b"import os\nprint('hello')\n"})
         monkeypatch.setattr("agent.subprocess.run", fake)
         result = fetch_file_contents("owner/repo", self.VALID_SHA, ["good.py"])
@@ -483,7 +476,6 @@ class TestFetchFileContents:
 
     def test_rejects_invalid_sha(self, monkeypatch):
         """Invalid head_sha format returns empty list without making API calls."""
-        from agent import fetch_file_contents
         call_count = 0
         def no_calls(cmd, **kwargs):
             nonlocal call_count
@@ -495,7 +487,6 @@ class TestFetchFileContents:
 
     def test_rejects_invalid_repo_format(self, monkeypatch):
         """Malformed repo names (e.g. path traversal) are rejected without API calls."""
-        from agent import fetch_file_contents
         call_count = 0
         def no_calls(cmd, **kwargs):
             nonlocal call_count
@@ -512,7 +503,6 @@ class TestFetchFileContents:
 
     def test_url_encodes_filenames(self, monkeypatch):
         """Filenames with spaces/special chars are URL-encoded in the API call."""
-        from agent import fetch_file_contents
         captured_urls = []
         class FakeResult:
             stdout = b"content"

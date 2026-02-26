@@ -214,6 +214,9 @@ def fetch_file_contents(
 
     for filename in targets:
         encoded_path = quote(filename, safe="/")
+        # capture_output without text=True is intentional: we need raw
+        # bytes to detect binary content (null-byte check) before
+        # decoding as UTF-8.
         result = subprocess.run(
             ["gh", "api",
              f"repos/{repo}/contents/{encoded_path}?ref={head_sha}",
@@ -341,7 +344,7 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
         if head_sha:
             filenames = extract_diff_filenames(diff_result.stdout)
             fetchable = [f for f in filenames if not is_low_priority(f)]
-            raw_files = fetch_file_contents(repo, head_sha, filenames)
+            raw_files = fetch_file_contents(repo, head_sha, fetchable)
             file_contents_str, file_note = format_file_contents(
                 raw_files, max_chars=MAX_FILE_CHARS,
             )
@@ -352,7 +355,7 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
                 names = ", ".join(fetchable[15:25])
                 suffix = "..." if capped > 10 else ""
                 notes.append(
-                    f"({capped} file(s) not fetched due to 15-file limit: "
+                    f"({capped} file(s) exceeded 15-file fetch limit: "
                     f"{names}{suffix})"
                 )
             if file_note:
