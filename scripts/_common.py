@@ -84,8 +84,10 @@ def load_config(root: Path) -> dict:
             value = value[1:-1]
         else:
             # Strip inline comments for unquoted values (e.g. KEY=value # comment).
-            # Only " #" is treated as a comment start — bare "#" inside values
-            # is preserved (handles e.g. URLs with fragments).
+            # Only " #" (space + hash) is treated as a comment start — bare "#"
+            # without a leading space is preserved (e.g. token#nospace).  Note:
+            # values containing " #" literally (e.g. URL anchors like
+            # page #section) would still be truncated; quote those values.
             comment_idx = value.find(" #")
             if comment_idx != -1:
                 value = value[:comment_idx].rstrip()
@@ -194,7 +196,12 @@ def gh_paginate(url: str, headers: dict, params: dict | None = None,
             raise ProvisionError(
                 f"GitHub API error ({resp.status_code}): {resp.text}"
             )
-        all_items.extend(resp.json())
+        page_data = resp.json()
+        if not isinstance(page_data, list):
+            raise ProvisionError(
+                f"GitHub API returned unexpected response shape: {repr(page_data)[:200]}"
+            )
+        all_items.extend(page_data)
         # Follow pagination — params are baked into the Link URL for page 2+
         url = None
         params = None

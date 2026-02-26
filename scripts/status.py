@@ -51,6 +51,7 @@ def main():
     print(f"Logs:     ssh root@{ip} journalctl -u pr-review -f")
 
     if server.status != "running":
+        print(f"\nServer is '{server.status}', not running — skipping health checks.")
         sys.exit(1)
 
     # Check service health via SSH

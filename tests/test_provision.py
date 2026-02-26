@@ -310,6 +310,19 @@ class TestGhPaginate:
         assert items == [{"id": 1}, {"id": 2}, {"id": 3}]
         assert mock_get.call_count == 3
 
+    @patch("_common.requests.get")
+    def test_raises_on_non_list_response(self, mock_get):
+        from _common import ProvisionError, gh_paginate
+
+        # GitHub might return a dict (e.g. rate-limit info) instead of a list
+        mock_get.return_value = _gh_response(200, {"message": "rate limit exceeded"})
+
+        with pytest.raises(ProvisionError, match="unexpected response shape"):
+            gh_paginate(
+                "https://api.github.com/orgs/x/hooks",
+                headers={"Authorization": "Bearer tok"},
+            )
+
 
 # ── GitHub webhook construction ────────────────────────────
 

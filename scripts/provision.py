@@ -68,16 +68,37 @@ def find_local_pubkey() -> str:
     )
 
 
+def _local_key_fingerprint(pubkey_content: str) -> str:
+    """Compute the MD5 fingerprint of a local SSH public key.
+
+    Returns the fingerprint in the ``aa:bb:cc:...`` format used by Hetzner.
+    """
+    result = subprocess.run(
+        ["ssh-keygen", "-lf", "-", "-E", "md5"],
+        input=pubkey_content, capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise ProvisionError(f"ssh-keygen failed: {result.stderr.strip()}")
+    # Output format: "2048 MD5:aa:bb:cc:... comment (RSA)"
+    return result.stdout.split()[1].removeprefix("MD5:")
+
+
 def ensure_ssh_key(client: Client, pubkey_content: str, name: str = "pr-review") -> SSHKey:
-    """Find or create the SSH key on Hetzner (matched by fingerprint)."""
+    """Find or create the SSH key on Hetzner (matched by fingerprint).
+
+    Compares cryptographic fingerprints rather than raw key text so that
+    differing comment fields (e.g. ``user@newhost`` vs ``user@oldhost``)
+    don't cause a false "different key" mismatch.
+    """
     try:
         key = client.ssh_keys.create(name=name, public_key=pubkey_content)
         print(f"  Created SSH key '{name}' on Hetzner")
         return key
     except APIException as e:
         if e.code == "uniqueness_error":
+            local_fp = _local_key_fingerprint(pubkey_content)
             for key in client.ssh_keys.get_all():
-                if key.public_key.strip() == pubkey_content.strip():
+                if key.fingerprint == local_fp:
                     print(f"  Reusing SSH key '{key.name}' on Hetzner")
                     return key
             # Name collision with a different key
@@ -123,6 +144,11 @@ def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str
         if server.status == "running":
             print(" ok")
             return server
+        if server.status in ("error", "off"):
+            print()
+            raise ProvisionError(
+                f"Server entered state '{server.status}' — check Hetzner console"
+            )
         print(".", end="", flush=True)
         time.sleep(5)
     raise ProvisionError("Server did not reach 'running' status in time")
@@ -159,22 +185,17 @@ def inject_auth(ip: str, config: dict):
         )
 
     # Claude Code auth — upsert token in the service env file.
-    # Token is piped via stdin to a Python one-liner that reads it with
-    # sys.stdin and writes to the .env file.  This avoids sed metacharacter
-    # issues (|, &, \ in the token would silently corrupt a sed replacement)
-    # and never exposes the token in process args (/proc/*/cmdline).
+    # Strategy: remove any existing line, then append the new one.
+    # Token is piped via stdin into a shell variable so it never appears in
+    # process args (/proc/*/cmdline).  grep -v + mv avoids sed metacharacter
+    # issues (|, &, \ in the token would silently corrupt a sed replacement).
     print("  Injecting Claude Code auth token...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
-         "python3 -c \""
-         "import sys, pathlib; "
-         "t = sys.stdin.read().strip(); "
-         "p = pathlib.Path('/opt/pr-review/.env'); "
-         "lines = [l for l in p.read_text().splitlines() "
-         "if not l.startswith('CLAUDE_CODE_AUTH_TOKEN=')]; "
-         "lines.append('CLAUDE_CODE_AUTH_TOKEN=' + t); "
-         "p.write_text('\\\\n'.join(lines) + '\\\\n')"
-         "\""],
+         "TOKEN=$(cat) && "
+         "grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env > /tmp/.env.new && "
+         "mv /tmp/.env.new /opt/pr-review/.env && "
+         "echo \"CLAUDE_CODE_AUTH_TOKEN=${TOKEN}\" >> /opt/pr-review/.env"],
         input=config["CLAUDE_CODE_AUTH_TOKEN"],
         capture_output=True, text=True, timeout=30,
     )
