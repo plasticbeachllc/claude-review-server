@@ -369,8 +369,8 @@ def collapse_old_reviews(repo: str, pr_number: int):
         try:
             # @json double-encodes: the outer json.loads unwraps the string
             # envelope, the inner one parses the actual object.  We use @json
-            # (rather than jq -c) because -c still emits literal newlines
-            # inside string values, breaking line-based iteration.
+            # because `gh api --jq` pretty-prints objects by default (spanning
+            # multiple lines), which breaks splitlines() iteration.
             comment = json.loads(json.loads(line))
             comment_id = comment.get("id")
             old_body = comment.get("body")
