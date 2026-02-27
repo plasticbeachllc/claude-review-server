@@ -82,7 +82,7 @@ def main():
             health_ok = json.loads(health).get("status") == "healthy"
         except (json.JSONDecodeError, AttributeError):
             health_ok = False
-        print(f"Health:   {health if health_ok else '(unreachable)'}")
+        print(f"Health:   {health if health_ok else f'(unhealthy: {health.strip()})'}")
         if not health_ok:
             healthy = False
     except Exception:
