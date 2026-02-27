@@ -152,3 +152,29 @@ class TestStatusHealthCheck:
         with pytest.raises(SystemExit) as exc:
             main()
         assert exc.value.code == 2
+
+    @patch("status.requests.get")
+    @patch("status.ssh")
+    @patch("status.Client")
+    @patch("status.load_config")
+    def test_tunnel_failure_exits_two(self, mock_config, MockClient, mock_ssh, mock_requests_get):
+        from status import main
+        import requests as _requests
+
+        mock_config.return_value = {
+            "SERVER_NAME": "pr-review",
+            "HCLOUD_TOKEN": "tok",
+            "TUNNEL_HOSTNAME": "review.example.com",
+        }
+        mock_client = MockClient.return_value
+        mock_client.servers.get_by_name.return_value = self._make_server()
+
+        mock_ssh.side_effect = [
+            "active",
+            '{"status":"healthy"}',
+        ]
+        mock_requests_get.side_effect = _requests.ConnectionError("unreachable")
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
