@@ -30,7 +30,7 @@ def main():
     root = Path(__file__).resolve().parent.parent
 
     try:
-        config = load_config(root)
+        config = load_config(root, required_keys=["HCLOUD_TOKEN"])
     except ProvisionError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)

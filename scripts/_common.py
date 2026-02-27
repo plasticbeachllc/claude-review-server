@@ -67,8 +67,12 @@ class CloudInitError(ProvisionError):
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-def load_config(root: Path) -> dict:
-    """Load .env file and validate required keys."""
+def load_config(root: Path, *, required_keys: list[str] | None = None) -> dict:
+    """Load .env file and validate required keys.
+
+    Pass *required_keys* to override the default ``REQUIRED_KEYS`` list
+    (useful for lightweight callers like ``status.py``).
+    """
     env_path = root / ".env"
     if not env_path.exists():
         raise ProvisionError(f".env not found at {env_path} — cp .env.example .env")
@@ -105,7 +109,7 @@ def load_config(root: Path) -> dict:
         config.setdefault(key, default)
 
     # Validate
-    missing = [k for k in REQUIRED_KEYS if not config.get(k)]
+    missing = [k for k in (required_keys if required_keys is not None else REQUIRED_KEYS) if not config.get(k)]
     if missing:
         raise ProvisionError(f"Missing required .env keys: {', '.join(missing)}")
 
