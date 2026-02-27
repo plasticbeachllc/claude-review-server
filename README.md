@@ -1,6 +1,6 @@
 # Claude Review Server
 
-A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated in your GitHub org, the agent posts a concise, actionable review comment. Force-pushes automatically collapse old reviews so the conversation stays clean.
+A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated on your GitHub account (org or personal), the agent posts a concise, actionable review comment. Force-pushes automatically collapse old reviews so the conversation stays clean.
 
 ```
 GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code → PR comment
@@ -33,7 +33,7 @@ You also need accounts with:
 - [**Hetzner Cloud**](https://console.hetzner.cloud/) (server hosting, ~$4/mo)
 - [**Cloudflare**](https://dash.cloudflare.com/) (tunnel + DNS, free tier works)
 - A **domain name** managed by Cloudflare DNS — cheap TLDs like `.xyz` or `.click` work fine (~$2/year via [Cloudflare Registrar](https://www.cloudflare.com/products/registrar/))
-- [**GitHub**](https://github.com/) org with admin access (to create and install a GitHub App)
+- [**GitHub**](https://github.com/) account (org or personal) with admin access (to create and install a GitHub App)
 - A **Claude Code subscription** (Pro or Max)
 
 ### SSH key setup
@@ -120,9 +120,9 @@ Run `claude setup-token` locally, follow the prompts, and copy the resulting tok
 
 A subdomain of the domain you selected above, e.g. `pr-review.example.com`.
 
-#### `GITHUB_ORG`
+#### `GITHUB_OWNER`
 
-Your GitHub org name as it appears in the URL (`github.com/my-org` → `my-org`).
+Your GitHub org or username as it appears in the URL (`github.com/my-org` → `my-org`).
 
 <details>
 <summary>What your <code>.env</code> should look like after this step</summary>
@@ -156,7 +156,7 @@ CF_ZONE_ID=789ghi012jkl...                        # ← you filled this in
 TUNNEL_HOSTNAME=pr-review.example.com             # ← you filled this in
 
 # ── GitHub ───────────────────────────────────────
-GITHUB_ORG=my-org                                 # ← you filled this in
+GITHUB_OWNER=my-org                               # ← you filled this in
 ```
 
 </details>
@@ -167,7 +167,7 @@ GITHUB_ORG=my-org                                 # ← you filled this in
 just create-app
 ```
 
-This opens your browser twice — click **Create GitHub App**, then **Install** on your org. The script captures the credentials automatically.
+This opens your browser twice — click **Create GitHub App**, then **Install** on your account. The script captures the credentials automatically.
 
 When it finishes, `GH_APP_ID`, `GH_INSTALLATION_ID`, `GITHUB_WEBHOOK_SECRET` are filled in your `.env` and a `github-app.pem` file appears in the project root. Don't edit these values manually.
 
@@ -207,7 +207,7 @@ When it finishes, you'll see:
 just status
 ```
 
-You should see an OK status. Then open a PR on any repo in your org — a review comment should appear within 1–3 minutes. Watch it live:
+You should see an OK status. Then open a PR on any repo where the app is installed — a review comment should appear within 1–3 minutes. Watch it live:
 
 ```bash
 ssh root@<server-ip> journalctl -u pr-review -f
@@ -307,7 +307,7 @@ Justfile                 # All commands: build, test, deploy, provision, destroy
 
 | Command | What it does |
 |---------|-------------|
-| `just create-app` | Create GitHub App + webhook, install on org (one-time) |
+| `just create-app` | Create GitHub App + webhook, install on account (one-time) |
 | `just provision` | Create server + tunnel (fully automated) |
 | `just status` | Check server health and status |
 | `just deploy root@host` | Push code changes to a running server |
@@ -395,11 +395,11 @@ curl http://localhost:8080/health
 
 If you didn't use `just create-app`, create the app manually:
 
-1. GitHub org → **Settings → Developer settings → GitHub Apps → New GitHub App**
+1. GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App**
 2. Set permissions: `Contents: Read`, `Pull requests: Read & write`
 3. Subscribe to **Pull request** events
 4. Set webhook URL to `https://<your-hostname>/webhook`
-5. Install the app on your org
+5. Install the app on your account
 6. Add `GH_APP_ID`, `GH_INSTALLATION_ID`, `GITHUB_WEBHOOK_SECRET` to your `.env`
 7. Save the private key as `github-app.pem`
 

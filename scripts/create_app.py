@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Create a GitHub App via the manifest flow and install it on your org.
+"""Create a GitHub App via the manifest flow and install it on your account.
 
 This is a one-time setup step.  Run ``just create-app`` before your first
 ``just provision``.
+
+Works with both GitHub organizations and personal accounts.
 
 The script:
   1. Starts a temporary local HTTP server
   2. Opens your browser to GitHub with the app manifest
   3. You approve the app on GitHub
   4. GitHub redirects back; the script captures the app credentials
-  5. You install the app on your org (browser opens automatically)
+  5. You install the app on your account (browser opens automatically)
   6. The script discovers the installation ID
 
 Credentials are saved to ``.env`` and ``github-app.pem``.
@@ -40,6 +42,27 @@ from _jwt import generate_jwt  # noqa: E402
 
 GH_API = "https://api.github.com"
 PEM_FILENAME = "github-app.pem"
+
+
+def _is_org(owner: str) -> bool:
+    """Check whether a GitHub account is an organization (vs personal user)."""
+    resp = requests.get(
+        f"{GH_API}/users/{owner}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(
+            f"ERROR: Could not look up account type for '{owner}' "
+            f"(HTTP {resp.status_code}).\n"
+            f"Check that GITHUB_OWNER is correct in .env.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return resp.json().get("type") == "Organization"
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +158,21 @@ class _ManifestHandler(BaseHTTPRequestHandler):
         """Serve an HTML page that auto-submits the manifest to GitHub."""
         server = self.server
         manifest_escaped = html.escape(json.dumps(server.manifest))  # type: ignore[attr-defined]
-        org_escaped = html.escape(server.org)  # type: ignore[attr-defined]
+        owner_escaped = html.escape(server.owner)  # type: ignore[attr-defined]
+        if server.is_org:  # type: ignore[attr-defined]
+            action_url = f"https://github.com/organizations/{owner_escaped}/settings/apps/new"
+        else:
+            action_url = "https://github.com/settings/apps/new"
         page = textwrap.dedent(f"""\
             <!DOCTYPE html>
             <html>
             <head><title>Create GitHub App</title></head>
             <body>
-            <h2>Creating GitHub App for {org_escaped}...</h2>
+            <h2>Creating GitHub App for {owner_escaped}...</h2>
             <p>If you are not redirected automatically,
                click the button below.</p>
             <form id="manifest-form" method="post"
-                  action="https://github.com/organizations/{org_escaped}/settings/apps/new">
+                  action="{action_url}">
               <input type="hidden" name="manifest" value="{manifest_escaped}">
               <button type="submit">Create GitHub App</button>
             </form>
@@ -183,10 +210,10 @@ def create_app(root: Path) -> dict:
     config = _read_env(env_path)
 
     # Validate required keys for app creation
-    org = config.get("GITHUB_ORG")
+    owner = config.get("GITHUB_OWNER")
     hostname = config.get("TUNNEL_HOSTNAME")
-    if not org:
-        print("ERROR: GITHUB_ORG not set in .env", file=sys.stderr)
+    if not owner:
+        print("ERROR: GITHUB_OWNER not set in .env", file=sys.stderr)
         sys.exit(1)
     if not hostname:
         print("ERROR: TUNNEL_HOSTNAME not set in .env", file=sys.stderr)
@@ -205,11 +232,16 @@ def create_app(root: Path) -> dict:
     state = secrets.token_hex(16)
     webhook_url = f"https://{hostname}/webhook"
 
+    # Detect whether the account is an org or personal user.
+    # The manifest creation URL differs between the two.
+    is_org = _is_org(owner)
+    account_label = "org" if is_org else "user"
+
     # Random suffix avoids name collisions if re-creating the app.
     # GitHub App names must be globally unique.
     suffix = secrets.token_hex(3)
     manifest = {
-        "name": f"pr-review-{org}-{suffix}",
+        "name": f"pr-review-{owner}-{suffix}",
         "url": "https://github.com/plasticbeachllc/claude-review-server",
         "hook_attributes": {
             # No "secret" key here — GitHub generates the webhook secret
@@ -233,11 +265,12 @@ def create_app(root: Path) -> dict:
     # Start local server
     server = HTTPServer(("127.0.0.1", port), _ManifestHandler)
     server.manifest = manifest  # type: ignore[attr-defined]
-    server.org = org  # type: ignore[attr-defined]
+    server.owner = owner  # type: ignore[attr-defined]
+    server.is_org = is_org  # type: ignore[attr-defined]
     server.expected_state = state  # type: ignore[attr-defined]
 
     print(f"[1/4] Starting local server on http://localhost:{port}")
-    print(f"  Opening browser to create GitHub App for org '{org}'...")
+    print(f"  Opening browser to create GitHub App for {account_label} '{owner}'...")
     print(f"  Webhook URL: {webhook_url}")
     print()
 
@@ -290,7 +323,7 @@ def create_app(root: Path) -> dict:
     data = resp.json()
     try:
         app_id = str(data["id"])
-        app_slug = data.get("slug", f"pr-review-{org}")
+        app_slug = data.get("slug", f"pr-review-{owner}")
         pem = data["pem"]
         webhook_secret = data["webhook_secret"]
     except KeyError as e:
@@ -317,11 +350,11 @@ def create_app(root: Path) -> dict:
     print(f"  Updated .env: GH_APP_ID={app_id}")
     print(f"  Webhook secret saved to .env")
 
-    # Install the app on the org
-    print(f"\n[3/4] Install the app on your org")
+    # Install the app
+    print(f"\n[3/4] Install the app on your account")
     install_url = f"https://github.com/apps/{app_slug}/installations/new"
     print(f"  Opening: {install_url}")
-    print(f"  Select your org '{org}' and click Install.")
+    print(f"  Select '{owner}' and click Install.")
     print()
     if not webbrowser.open(install_url):
         print(f"\n  No browser found. Open this URL manually:\n  {install_url}")
@@ -350,7 +383,7 @@ def create_app(root: Path) -> dict:
                 installations = resp.json()
                 for inst in installations:
                     account = inst.get("account", {})
-                    if account.get("login", "").lower() == org.lower():
+                    if account.get("login", "").lower() == owner.lower():
                         installation_id = str(inst["id"])
                         break
                 if installation_id:
