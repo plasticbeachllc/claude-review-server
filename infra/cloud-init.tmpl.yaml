@@ -176,10 +176,11 @@ runcmd:
   - ufw --force enable
 
   # ── Enable services (don't start pr-review yet — needs auth) ──
+  # pr-review is NOT enabled here: provision.py enables it after injecting
+  # credentials, so a premature reboot won't cause crash-loop restarts.
   - systemctl daemon-reload
   - systemctl enable caddy
   - systemctl restart caddy
-  - systemctl enable pr-review
   - |
     echo ""
     echo "════════════════════════════════════════════════════════"

@@ -33,8 +33,6 @@ from hcloud.ssh_keys import SSHKey
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    CF_API,
-    GH_API,
     SSH_OPTS,
     ProvisionError,
     cf_request,
@@ -480,9 +478,11 @@ def main():
         print("[7/8] Setting up Cloudflare Tunnel...")
         hostname = setup_tunnel(config, ip, created=created)
 
-        # 8. Start service (webhook is configured by `just create-app`)
+        # 8. Enable + start service (webhook is configured by `just create-app`)
+        # Enable here (not in cloud-init) so a premature reboot before auth
+        # injection won't cause crash-loop restarts.
         print("[8/8] Starting service...")
-        ssh(ip, "systemctl restart pr-review")
+        ssh(ip, "systemctl enable --now pr-review")
 
         # Verify the service actually started (retry to allow systemd to settle)
         print("  Verifying service started...", end="", flush=True)
