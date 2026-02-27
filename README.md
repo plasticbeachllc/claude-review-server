@@ -174,8 +174,8 @@ PORT=8080                                         # leave as-is
 # ── Hetzner Cloud ────────────────────────────────
 HCLOUD_TOKEN=aBcDeFgHiJkLmNoPqRsTuVwXyZ...       # ← you filled this in
 SERVER_NAME=pr-review                             # leave as-is
-SERVER_TYPE=cx11                                  # leave as-is
-SERVER_LOCATION=fsn1                              # leave as-is
+SERVER_TYPE=cax11                                 # leave as-is
+SERVER_LOCATION=nbg1                              # leave as-is
 SERVER_IMAGE=ubuntu-24.04                         # leave as-is
 
 # ── GitHub App (auto-populated by just create-app) ──

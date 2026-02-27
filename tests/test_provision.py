@@ -48,8 +48,8 @@ class TestLoadConfig:
         root = self._write_env(tmp_path, self._full_env())
         config = load_config(root)
         assert config["SERVER_NAME"] == "pr-review"
-        assert config["SERVER_TYPE"] == "cx11"
-        assert config["SERVER_LOCATION"] == "fsn1"
+        assert config["SERVER_TYPE"] == "cax11"
+        assert config["SERVER_LOCATION"] == "nbg1"
         assert config["SERVER_IMAGE"] == "ubuntu-24.04"
 
     def test_overrides_defaults(self, tmp_path):

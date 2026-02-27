@@ -27,8 +27,8 @@ REQUIRED_KEYS = [
 ]
 DEFAULTS = {
     "SERVER_NAME": "pr-review",
-    "SERVER_TYPE": "cx11",
-    "SERVER_LOCATION": "fsn1",
+    "SERVER_TYPE": "cax11",
+    "SERVER_LOCATION": "nbg1",
     "SERVER_IMAGE": "ubuntu-24.04",
 }
 
