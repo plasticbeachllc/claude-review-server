@@ -13,7 +13,9 @@ Number your points of feedback for easy reference. If the PR looks good, say so 
 
 {truncation_note}
 
-Diff:
+{file_contents}
+
+Diff (changes to review):
 ```
 {diff}
 ```

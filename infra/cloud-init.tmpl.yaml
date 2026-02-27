@@ -70,9 +70,9 @@ write_files:
       # Security hardening
       NoNewPrivileges=yes
       ProtectSystem=strict
-      ReadWritePaths=/opt/pr-review
+      ReadWritePaths=/opt/pr-review /home/review
       PrivateTmp=yes
-      ProtectHome=no              # Claude auth tokens live in ~review/.claude/
+      ProtectHome=no              # gh config + Claude auth tokens live in ~review/
       ProtectKernelTunables=yes
       ProtectKernelModules=yes
       ProtectControlGroups=yes
@@ -87,9 +87,14 @@ write_files:
 
 runcmd:
   # ── Install Node.js (for Claude Code) ─────────────────────
-  - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  - apt-get install -y nodejs
-  - npm install -g @anthropic-ai/claude-code@2.1.53
+  # GPG-verified apt repo (same pattern as Caddy and cloudflared above).
+  # pipefail ensures a curl failure isn't masked by gpg exiting 0.
+  - bash -o pipefail -c 'curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --yes --dearmor -o /usr/share/keyrings/nodesource.gpg'
+  # "nodistro" is NodeSource's intentional suite name (not a distro codename like jammy).
+  - echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+  - apt-get update && apt-get install -y nodejs
+  - npm install -g @anthropic-ai/claude-code@latest
+  - echo "Installed claude-code version:" && npm list -g @anthropic-ai/claude-code --depth=0
 
   # ── Install GitHub CLI ────────────────────────────────────
   - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -98,8 +103,8 @@ runcmd:
   - apt-get update && apt-get install -y gh
 
   # ── Install Caddy ─────────────────────────────────────────
-  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+  - bash -o pipefail -c 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg'
+  - bash -o pipefail -c 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list'
   - chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   - chmod o+r /etc/apt/sources.list.d/caddy-stable.list
   - apt-get update && apt-get install -y caddy
@@ -174,6 +179,7 @@ runcmd:
   # ── Enable services (don't start pr-review yet — needs auth) ──
   - systemctl daemon-reload
   - systemctl enable caddy
+  - systemctl restart caddy
   - systemctl enable pr-review
   - |
     echo ""
