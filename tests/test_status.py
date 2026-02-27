@@ -41,7 +41,8 @@ class TestStatusHealthCheck:
         ]
         mock_requests_get.return_value = MagicMock(status_code=200)
 
-        # Should exit cleanly (no sys.exit call = exit 0)
+        # Healthy path returns normally (no sys.exit); would raise SystemExit
+        # if any check failed.
         main()
 
     @patch("status.requests.get")

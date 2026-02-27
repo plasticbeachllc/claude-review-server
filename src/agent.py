@@ -371,10 +371,7 @@ def collapse_old_reviews(repo: str, pr_number: int):
             # envelope, the inner one parses the actual object.  We use @json
             # (rather than jq -c) because -c still emits literal newlines
             # inside string values, breaking line-based iteration.
-            inner = json.loads(line)
-            comment = json.loads(inner) if isinstance(inner, str) else inner
-            if not isinstance(comment, dict):
-                continue
+            comment = json.loads(json.loads(line))
             comment_id = comment.get("id")
             old_body = comment.get("body")
         except (json.JSONDecodeError, AttributeError, TypeError):
