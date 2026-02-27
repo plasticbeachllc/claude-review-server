@@ -423,9 +423,9 @@ def inject_auth(ip: str, config: dict):
     # Claude Code auth — upsert token in the service env file.
     # Token is piped via stdin into a shell variable so it never appears in
     # process args (/proc/*/cmdline).
-    print("  Injecting Claude Code auth token...")
-    _upsert_env_var(ip, "CLAUDE_CODE_AUTH_TOKEN", config["CLAUDE_CODE_AUTH_TOKEN"],
-                    label="CLAUDE_CODE_AUTH_TOKEN")
+    print("  Injecting Claude Code OAuth token...")
+    _upsert_env_var(ip, "CLAUDE_CODE_OAUTH_TOKEN", config["CLAUDE_CODE_OAUTH_TOKEN"],
+                    label="CLAUDE_CODE_OAUTH_TOKEN")
 
 
 # ---------------------------------------------------------------------------

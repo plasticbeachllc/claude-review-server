@@ -119,7 +119,7 @@ Open `.env` in your editor. You need to fill in **7 values manually** — the re
 4. Click **Generate API Token**, name it anything, select **Read & Write**
 5. Copy the token — it's only shown once
 
-#### `CLAUDE_CODE_AUTH_TOKEN`
+#### `CLAUDE_CODE_OAUTH_TOKEN`
 
 1. Open a terminal and run:
    ```bash
@@ -185,7 +185,7 @@ GH_INSTALLATION_ID=                               # ← auto-populated in Step 2
 GITHUB_WEBHOOK_SECRET=                            # ← auto-populated in Step 2
 
 # ── Claude Code ──────────────────────────────────
-CLAUDE_CODE_AUTH_TOKEN=sk-ant-...                  # ← you filled this in
+CLAUDE_CODE_OAUTH_TOKEN=eyJhb...                   # ← you filled this in
 
 # ── Cloudflare ───────────────────────────────────
 CF_API_TOKEN=aBcDeFgHiJkLmNoPqRsTuVwXyZ...       # ← you filled this in
@@ -465,7 +465,7 @@ scp github-app.pem root@<server-ip>:/opt/pr-review/github-app.pem
 #   GH_INSTALLATION_ID=<from .env>
 #   GH_APP_PRIVATE_KEY_FILE=/opt/pr-review/github-app.pem
 #   GITHUB_WEBHOOK_SECRET=<from .env>
-#   CLAUDE_CODE_AUTH_TOKEN=<from .env>
+#   CLAUDE_CODE_OAUTH_TOKEN=<from .env>
 
 # Fix permissions
 chown review:review /opt/pr-review/github-app.pem

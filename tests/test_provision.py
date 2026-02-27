@@ -24,7 +24,7 @@ class TestLoadConfig:
             "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
             "GH_INSTALLATION_ID": "67890",
             "GITHUB_WEBHOOK_SECRET": "whsec_test",
-            "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test",
             "CF_API_TOKEN": "cf-test-token",
             "CF_ACCOUNT_ID": "cf-account-123",
             "CF_ZONE_ID": "cf-zone-456",
@@ -746,7 +746,7 @@ class TestInjectAuth:
             "GH_INSTALLATION_ID": "67890",
             "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
             "GITHUB_WEBHOOK_SECRET": "whsec_test",
-            "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test",
         }
         if tmp_path:
             pem = tmp_path / "github-app.pem"

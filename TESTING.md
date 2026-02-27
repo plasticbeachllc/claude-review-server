@@ -30,7 +30,7 @@ Run through these phases in order before public release. Each checkbox is a pass
 - [ ] On server: `curl -s localhost:8080/health` returns `{"status":"healthy"}`
 - [ ] On server: `curl -s localhost:8081/health` returns `{"status":"healthy"}` (Caddy internal health port)
 - [ ] On server: `sudo -u review gh auth status` shows authenticated
-- [ ] On server: `/opt/pr-review/.env` contains `CLAUDE_CODE_AUTH_TOKEN=...`
+- [ ] On server: `/opt/pr-review/.env` contains `CLAUDE_CODE_OAUTH_TOKEN=...`
 - [ ] On server: `/opt/pr-review/.env` has `chmod 600` and owned by `review:review`
 
 ## Phase 3: External Connectivity
