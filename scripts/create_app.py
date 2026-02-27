@@ -264,15 +264,16 @@ def create_app(root: Path) -> dict:
         )
         sys.exit(1)
 
+    # Detect whether the account is an org or personal user.
+    # The manifest creation URL differs between the two.
+    # Done before _bind_free_port() so the socket isn't leaked if this exits.
+    is_org = _is_org(owner)
+    account_label = "org" if is_org else "user"
+
     sock = _bind_free_port()
     port = sock.getsockname()[1]
     state = secrets.token_hex(16)
     webhook_url = f"https://{hostname}/webhook"
-
-    # Detect whether the account is an org or personal user.
-    # The manifest creation URL differs between the two.
-    is_org = _is_org(owner)
-    account_label = "org" if is_org else "user"
 
     # Random suffix avoids name collisions if re-creating the app.
     # GitHub App names must be globally unique.
@@ -299,9 +300,12 @@ def create_app(root: Path) -> dict:
         "public": False,
     }
 
-    # Start local server — reuse the already-bound socket to avoid TOCTOU race
-    server = _ManifestServer(("127.0.0.1", port), _ManifestHandler)
+    # Start local server — reuse the already-bound socket to avoid TOCTOU race.
+    # bind_and_activate=False prevents the constructor from binding a second
+    # time (which would fail with EADDRINUSE on the already-bound socket).
+    server = _ManifestServer(("127.0.0.1", port), _ManifestHandler, bind_and_activate=False)
     server.socket = sock
+    server.server_activate()
     server.manifest = manifest
     server.owner = owner
     server.is_org = is_org
