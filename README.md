@@ -46,13 +46,22 @@ You also need accounts with:
 
 ### SSH key setup
 
-The provisioning script needs your SSH public key to upload to Hetzner. Without any configuration it auto-discovers keys in this order:
+The provisioning script needs your SSH public key to upload to Hetzner. If you already have a key at `~/.ssh/id_ed25519.pub` (or `id_ecdsa` / `id_rsa`), you're all set — the script auto-discovers it.
 
-1. `~/.ssh/id_ed25519.pub`, `~/.ssh/id_ecdsa.pub`, or `~/.ssh/id_rsa.pub` (standard files)
-2. The default SSH agent (`SSH_AUTH_SOCK`)
-3. Any `IdentityAgent` configured in `~/.ssh/config` (1Password, Secretive, etc.)
+**Don't have one?** Generate one:
 
-If you have multiple keys or want explicit control, set `SSH_KEY` in `.env`:
+```bash
+ssh-keygen -t ed25519 -C "your-email@example.com"
+```
+
+Accept the default path. A passphrase is optional.
+
+<details>
+<summary>Advanced: multiple keys, 1Password, or explicit selection</summary>
+
+The auto-discovery order is: standard `.pub` files → default SSH agent → `IdentityAgent` from `~/.ssh/config` (1Password, Secretive, etc.).
+
+To select a specific key, set `SSH_KEY` in `.env`:
 
 ```env
 # Point to a specific .pub file:
@@ -62,41 +71,15 @@ SSH_KEY=~/.ssh/my_hetzner_key.pub
 SSH_KEY=Hetzner - GitHub Webhooks
 ```
 
-**If you have a standard SSH key** — you're all set, no action needed. Verify with:
-
-```bash
-ls ~/.ssh/id_*.pub
-```
-
-To use a specific key instead of the default, set `SSH_KEY` to its path:
-
-```env
-SSH_KEY=~/.ssh/id_ed25519.pub
-```
-
-**If you don't have an SSH key yet** — generate one:
-
-```bash
-ssh-keygen -t ed25519 -C "your-email@example.com"
-```
-
-Accept the default path (`~/.ssh/id_ed25519`). A passphrase is optional.
-
-**If you use 1Password SSH agent** — it works automatically. The provisioning script reads the `IdentityAgent` directive from your `~/.ssh/config` and queries the 1Password agent socket directly. No `.pub` files needed.
-
-If you have multiple keys in 1Password, set `SSH_KEY` to the key's comment (the name shown in 1Password) to select the right one:
-
-```env
-SSH_KEY=Hetzner - GitHub Webhooks
-```
-
-To see which keys are available, run:
+**1Password SSH agent** works automatically — the script reads the `IdentityAgent` directive from `~/.ssh/config`. If you have multiple keys in 1Password, set `SSH_KEY` to the key's comment (the name shown in 1Password). To list available keys:
 
 ```bash
 SSH_AUTH_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock" ssh-add -L
 ```
 
 The comment is the third field on each line (e.g. `ssh-ed25519 AAAA... Hetzner - GitHub Webhooks`). If this says "The agent has no identities", enable the SSH agent in 1Password → Settings → Developer → SSH Agent.
+
+</details>
 
 ---
 
@@ -204,13 +187,12 @@ GITHUB_ORG=my-org                                 # ← you filled this in
 just create-app
 ```
 
-This is a one-time setup that:
+This is a one-time interactive setup:
 
-1. Opens your browser to GitHub
-2. You click **Create GitHub App** to approve
-3. GitHub redirects back — the script captures the app credentials
-4. Your browser opens again to install the app on your org — click **Install**
-5. The script detects the installation and saves everything
+1. Your browser opens to GitHub — click **Create GitHub App** to approve
+2. GitHub redirects back and the script captures the app credentials
+3. Your browser opens again to install the app on your org — click **Install**
+4. The script detects the installation and saves everything
 
 When it finishes, your `.env` will have `GH_APP_ID`, `GH_INSTALLATION_ID`, and `GITHUB_WEBHOOK_SECRET` filled in, and a `github-app.pem` file will appear in your project root.
 
@@ -222,7 +204,7 @@ When it finishes, your `.env` will have `GH_APP_ID`, `GH_INSTALLATION_ID`, and `
 just test
 ```
 
-All tests should pass. If any fail, fix your `.env` and retry.
+All tests should pass. If any fail, check your `.env` values — the tests validate configuration, webhook signature logic, and diff truncation.
 
 ### Step 4: Provision the server
 
@@ -261,9 +243,13 @@ When it finishes, you'll see:
 just status
 ```
 
-This checks the server is running and the tunnel is reachable. Exit code 0 means healthy.
+This checks the server is running and the tunnel is reachable. You should see an `OK` status and exit code 0.
 
-Then open a PR on any repo in your org. Within 1–3 minutes, a review comment should appear.
+Then open a PR on any repo in your org. Within 1–3 minutes, a review comment should appear. You can watch it happen live:
+
+```bash
+ssh root@<server-ip> journalctl -u pr-review -f
+```
 
 ---
 
@@ -277,7 +263,7 @@ After editing `src/agent.py` or `src/prompt.md` locally:
 just deploy root@<server-ip>
 ```
 
-This copies the files to the server, restarts the service, and takes effect immediately. No re-provisioning needed.
+This copies the files to the server, restarts the service, and takes effect immediately. No re-provisioning needed. (Find your server IP in the `just provision` output or via `just status`.)
 
 ### Check server health
 
@@ -335,14 +321,7 @@ just destroy yes && just provision
 
 ### Smart diff truncation
 
-Large PRs are truncated for context limitations. The system drops files in this order:
-
-1. Lockfiles (`package-lock.json`, `yarn.lock`, `Cargo.lock`, ...)
-2. Generated/minified code (`.min.js`, `.pb.go`, ...)
-3. Snapshots, SVGs, vendored code
-4. Remaining files by size (largest first)
-
-A note is added to the review listing which files were omitted.
+Large PRs are truncated to fit context limits. Low-priority files — lockfiles, generated/minified code, snapshots, SVGs, and vendored code — are dropped first. Within each group, the largest files are dropped first. A note is added to the review listing which files were omitted.
 
 ---
 
@@ -405,6 +384,7 @@ Justfile                 # All commands: build, test, deploy, provision, destroy
 | `just status` | Check server health and status |
 | `just deploy root@host` | Push code changes to a running server |
 | `just build` | Assemble cloud-init.yaml from template |
+| `just validate` | Build + validate cloud-init.yaml schema (requires `cloud-init` CLI) |
 | `just test` | Run unit tests |
 | `just destroy yes` | Tear down server + tunnel + DNS (App preserved) |
 | `just clean` | Remove built cloud-init.yaml |
@@ -453,11 +433,16 @@ cloudflared service install <YOUR_TUNNEL_TOKEN>
 
 ### 4. Configure the server
 
+From your local machine, copy the GitHub App private key:
+
+```bash
+scp github-app.pem root@<server-ip>:/opt/pr-review/github-app.pem
+```
+
+Then SSH in and finish configuration:
+
 ```bash
 ssh root@<server-ip>
-
-# Copy GitHub App private key
-scp github-app.pem root@<server-ip>:/opt/pr-review/github-app.pem
 
 # Add credentials to /opt/pr-review/.env:
 #   GH_APP_ID=<from .env>
@@ -504,7 +489,7 @@ Open a PR. You should see a review comment within 1–2 minutes.
 |---------|-----|
 | Webhook returns 404 | The agent only responds to `POST /webhook` and `GET /health` |
 | Agent won't start | `journalctl -u pr-review --no-pager -n 30` — usually a missing env var |
-| Claude auth errors | `sudo -u review claude` to re-authenticate, then `systemctl restart pr-review` |
+| Claude auth errors | SSH into the server, run `sudo -u review claude` to re-authenticate, then `systemctl restart pr-review` |
 | Reviews aren't posting | Check App credentials in `/opt/pr-review/.env` and PEM file permissions |
 | Tunnel not connecting | `systemctl status cloudflared` and check Cloudflare Zero Trust dashboard |
 
