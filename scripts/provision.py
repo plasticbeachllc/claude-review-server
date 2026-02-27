@@ -551,6 +551,7 @@ def setup_tunnel(config: dict, server_ip: str, created: dict | None = None) -> s
     return hostname
 
 
+
 def _auto_cleanup(created: dict, config: dict):
     """Best-effort cleanup of partially created resources on failure."""
     if not created:

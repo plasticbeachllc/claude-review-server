@@ -3,7 +3,7 @@ Title: {pr_title}
 Description: {pr_body}
 
 Review this diff. Be concise and actionable. Focus on:
-1. Idiomatic patterns, concise code, and correctness
+1. Code quality
 2. Security concerns
 3. Performance and stability
 4. User experience

@@ -510,11 +510,11 @@ def collapse_old_reviews(repo: str, pr_number: int):
 
     for line in result.stdout.strip().splitlines():
         try:
-            # @json double-encodes: the outer json.loads unwraps the string
-            # envelope, the inner one parses the actual object.  We use @json
-            # because `gh api --jq` pretty-prints objects by default (spanning
-            # multiple lines), which breaks splitlines() iteration.
-            comment = json.loads(json.loads(line))
+            # @json produces compact JSON (one object per line), so a single
+            # json.loads is sufficient.
+            comment = json.loads(line)
+            if isinstance(comment, str):
+                comment = json.loads(comment)  # handle double-encoded edge case
             comment_id = comment.get("id")
             old_body = comment.get("body")
         except (json.JSONDecodeError, AttributeError, TypeError):

@@ -1236,6 +1236,16 @@ class TestWebhookHandlerGet:
 
 
 class TestWebhookHandlerPost:
+    @staticmethod
+    def _wait_for_call(mock, timeout=2.0):
+        """Poll until *mock* has been called (handler processes after 200)."""
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if mock.call_count > 0:
+                return
+            time.sleep(0.01)
+
     def _post(self, http_server, path, payload, headers=None):
         import http.client
         host, port = http_server
@@ -1294,6 +1304,7 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
+        self._wait_for_call(mock_schedule)
         mock_schedule.assert_called_once()
         args = mock_schedule.call_args[0]
         assert args[0] == "owner/repo#42"  # pr_key
@@ -1316,6 +1327,7 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
+        self._wait_for_call(mock_schedule)
         mock_schedule.assert_called_once()
         call_args = mock_schedule.call_args
         # Verify delay=DEBOUNCE_SECONDS for synchronize events
