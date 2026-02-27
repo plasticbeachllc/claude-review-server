@@ -131,7 +131,6 @@ runcmd:
 
     # Internal health checks only — not exposed externally (UFW blocks 8081)
     :8081 {
-        respond /ping "pong" 200
         reverse_proxy /health 127.0.0.1:8080
     }
     CADDYEOF

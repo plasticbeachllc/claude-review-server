@@ -721,16 +721,21 @@ class TestAlreadyReviewed:
 # ── collapse_old_reviews ────────────────────────────────
 
 
+def _jq_json_line(obj: dict) -> str:
+    """Simulate jq's @json filter: double-encode a dict as a JSON string."""
+    return json.dumps(json.dumps(obj))
+
+
 class TestCollapseOldReviews:
     @patch("agent.subprocess.run")
     def test_collapses_uncollapsed_reviews(self, mock_run):
-        comment_json = json.dumps({
+        line = _jq_json_line({
             "id": 123,
             "body": f"{REVIEW_MARKER}\n## Review\nLooks good!",
         })
         # First call: list comments; second call: PATCH
         mock_run.side_effect = [
-            _subprocess_result(stdout=comment_json + "\n"),
+            _subprocess_result(stdout=line + "\n"),
             _subprocess_result(),
         ]
 
@@ -759,7 +764,7 @@ class TestCollapseOldReviews:
     @patch("agent.subprocess.run")
     def test_handles_multiple_comments(self, mock_run):
         comments = "\n".join(
-            json.dumps({"id": i, "body": f"{REVIEW_MARKER}\nReview #{i}"})
+            _jq_json_line({"id": i, "body": f"{REVIEW_MARKER}\nReview #{i}"})
             for i in [10, 20, 30]
         )
         mock_run.side_effect = [
@@ -782,7 +787,7 @@ class TestCollapseOldReviews:
 
     @patch("agent.subprocess.run")
     def test_skips_malformed_json_lines(self, mock_run):
-        output = "not-json\n" + json.dumps({"id": 1, "body": f"{REVIEW_MARKER}\nOk"})
+        output = "not-json\n" + _jq_json_line({"id": 1, "body": f"{REVIEW_MARKER}\nOk"})
         mock_run.side_effect = [
             _subprocess_result(stdout=output + "\n"),
             _subprocess_result(),  # PATCH for the valid one
@@ -795,7 +800,7 @@ class TestCollapseOldReviews:
 
     @patch("agent.subprocess.run")
     def test_skips_comment_with_missing_id(self, mock_run):
-        output = json.dumps({"body": f"{REVIEW_MARKER}\nno id"})
+        output = _jq_json_line({"body": f"{REVIEW_MARKER}\nno id"})
         mock_run.side_effect = [
             _subprocess_result(stdout=output + "\n"),
         ]
@@ -809,9 +814,9 @@ class TestCollapseOldReviews:
     def test_deduplicates_marker_in_collapsed_body(self, mock_run):
         """Marker appears once at the top of the collapsed body, not duplicated inside <details>."""
         original_body = f"{REVIEW_MARKER}\n## Review\nGreat code!"
-        comment_json = json.dumps({"id": 5, "body": original_body})
+        line = _jq_json_line({"id": 5, "body": original_body})
         mock_run.side_effect = [
-            _subprocess_result(stdout=comment_json + "\n"),
+            _subprocess_result(stdout=line + "\n"),
             _subprocess_result(),
         ]
 
@@ -820,6 +825,24 @@ class TestCollapseOldReviews:
         patch_args = mock_run.call_args_list[1][0][0]
         body_arg = [a for a in patch_args if a.startswith("body=")][0]
         assert body_arg.count(REVIEW_MARKER) == 1
+
+    @patch("agent.subprocess.run")
+    def test_handles_newlines_in_body(self, mock_run):
+        """@json encoding ensures bodies with newlines don't break line-based parsing."""
+        body_with_newlines = f"{REVIEW_MARKER}\n## Review\n\nLine 1\nLine 2\nLine 3"
+        line = _jq_json_line({"id": 42, "body": body_with_newlines})
+        mock_run.side_effect = [
+            _subprocess_result(stdout=line + "\n"),
+            _subprocess_result(),
+        ]
+
+        collapse_old_reviews("owner/repo", 1)
+
+        assert mock_run.call_count == 2
+        patch_args = mock_run.call_args_list[1][0][0]
+        body_arg = [a for a in patch_args if a.startswith("body=")][0]
+        assert "<details>" in body_arg
+        assert "Line 1" in body_arg
 
 
 # ── review_pr ───────────────────────────────────────────

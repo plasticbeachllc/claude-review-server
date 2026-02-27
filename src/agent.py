@@ -351,13 +351,15 @@ def already_reviewed(repo: str, pr_number: int) -> bool:
 
 def collapse_old_reviews(repo: str, pr_number: int):
     """Edit previous review comments to collapse them under a <details> tag."""
+    # Use @json on each object to guarantee one JSON object per line,
+    # even when comment bodies contain literal newlines.
     result = subprocess.run(
         ["gh", "api",
          f"/repos/{repo}/issues/{pr_number}/comments",
          "--paginate", "--jq",
          '.[] | select(.body | contains("<!-- claude-review -->")) '
          '| select(.body | contains("<details>") | not) '
-         '| {id: .id, body: .body}'],
+         '| {id: .id, body: .body} | @json'],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0 or not result.stdout.strip():
@@ -365,10 +367,14 @@ def collapse_old_reviews(repo: str, pr_number: int):
 
     for line in result.stdout.strip().splitlines():
         try:
-            comment = json.loads(line)
+            # @json double-encodes: the outer json.loads unwraps the string
+            # envelope, the inner one parses the actual object.  We use @json
+            # because `gh api --jq` pretty-prints objects by default (spanning
+            # multiple lines), which breaks splitlines() iteration.
+            comment = json.loads(json.loads(line))
             comment_id = comment.get("id")
             old_body = comment.get("body")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, TypeError):
             continue
 
         if not comment_id or not old_body:
