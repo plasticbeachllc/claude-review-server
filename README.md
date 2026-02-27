@@ -217,6 +217,8 @@ ssh root@<server-ip> journalctl -u pr-review -f
 
 ## Updating
 
+### Agent code
+
 After editing `src/agent.py` or `src/prompt.md`, hot-deploy without re-provisioning:
 
 ```bash
@@ -226,6 +228,36 @@ ssh root@<server-ip> journalctl -u pr-review -f   # tail logs
 ```
 
 Find your server IP in the `just provision` output or via `just status`.
+
+### Claude Code version
+
+The server installs `@anthropic-ai/claude-code@2` (pinned to the major version). To update to a new major version or pin to an exact release:
+
+1. Edit the version in `infra/cloud-init.tmpl.yaml` (search for `claude-code@`)
+2. Re-provision: `just destroy yes && just provision`
+
+To update on a running server without re-provisioning:
+
+```bash
+ssh root@<server-ip> npm install -g @anthropic-ai/claude-code@2
+ssh root@<server-ip> systemctl restart pr-review
+```
+
+### GPG signing keys
+
+Provisioning pins the SHA-256 hashes of vendor GPG keys (NodeSource, GitHub CLI, Cloudflare) to guard against supply-chain tampering. If a vendor rotates their key, provisioning will fail with a clear error. To update a hash:
+
+```bash
+curl -fsSL <key-url> | sha256sum
+```
+
+Replace the old hash in `infra/cloud-init.tmpl.yaml` and update the reference in `.env.example`. The key URLs are:
+
+| Vendor | Key URL |
+|--------|---------|
+| NodeSource | `https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key` |
+| GitHub CLI | `https://cli.github.com/packages/githubcli-archive-keyring.gpg` |
+| Cloudflare | `https://pkg.cloudflare.com/cloudflare-main.gpg` |
 
 ---
 
