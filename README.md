@@ -1,8 +1,6 @@
 # Claude Review Server
 
-**Automatic, intelligent PR reviews on every push — powered by your Claude Code subscription.**
-
-Open a pull request, get a thoughtful code review in under two minutes. No SaaS, no per-seat pricing, no sending your code to a third party. Just Claude, running on a $4/month server you control.
+A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated in your GitHub org, the agent posts a concise, actionable review comment.
 
 ```
 GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code → PR comment
@@ -12,16 +10,7 @@ GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code 
 
 ## What you get
 
-When someone opens or updates a PR in your org, the agent reads the diff and posts a review like this:
-
-> ## Review
->
-> 1. **SQL injection risk** — `query.build()` on line 42 interpolates user input directly. Use parameterized queries instead.
-> 2. **Missing error handling** — the `/api/submit` endpoint doesn't catch `TimeoutError`, which will crash the worker.
-> 3. **Nice refactor** — extracting the validation logic into `validate_input()` makes this much easier to test.
->
-> ---
-> *Automated review by Claude Code*
+When someone opens or updates a PR in your org, the agent reads edited files and posts a review.
 
 When someone force-pushes, old reviews are automatically collapsed so the conversation stays clean.
 
@@ -42,7 +31,7 @@ When someone force-pushes, old reviews are automatically collapsed so the conver
 
 ### One-command deploy
 
-Fill in your tokens, run one command, and the server provisions itself — Hetzner VM, Cloudflare Tunnel, GitHub webhook, everything.
+Fill `.env` with your secrets, run one command, and the server provisions itself — Hetzner VM, Cloudflare Tunnel, and GitHub webhook included.
 
 ```bash
 git clone https://github.com/plasticbeachllc/claude-review-server.git
@@ -53,9 +42,9 @@ cp .env.example .env
 just provision
 ```
 
-That's it. Open a PR in your org to see it work.
+That's all. Open a PR in your org to see it works.
 
-### What goes in `.env`
+### Contents of `.env`
 
 | Variable | Where to get it |
 |----------|----------------|
@@ -83,15 +72,15 @@ just destroy yes               # Tear everything down
 1. **GitHub sends a webhook** when a PR is opened or updated
 2. **Signature verification** — the agent validates the HMAC-SHA256 signature; forged requests are rejected
 3. **Draft filtering** — draft PRs are skipped
-4. **Diff retrieval** — fetches the full diff via `gh pr diff`
-5. **Smart truncation** — if the diff exceeds 40K chars, lockfiles and generated code are dropped first so Claude reviews what matters most
-6. **Claude reviews** — the diff is sent to Claude Code CLI with a customizable prompt
+4. **Diff retrieval** — fetches edited files using the GitHub CLI
+5. **Smart truncation** — if truncation is necssary to fit context, lockfiles and generated code are dropped first
+6. **Claude reviews** — Customizable prompt drives review mechanics
 7. **Comment posted** — the review appears as a PR comment within 1–2 minutes
-8. **Force-push handling** — previous reviews are collapsed under a `<details>` tag
+8. **Force-push handling** — prior reviews are collapsed under a `<details>` tag; ongoing reviews are restarted
 
 ### Smart diff truncation
 
-Large PRs don't break the system. The agent intelligently drops files in this order:
+Large PRs are truncated for context limitations. The system drops files in this order:
 
 1. Lockfiles (`package-lock.json`, `yarn.lock`, `Cargo.lock`, ...)
 2. Generated/minified code (`.min.js`, `.pb.go`, ...)
@@ -106,7 +95,7 @@ A note is added to the review listing which files were omitted.
 
 ### Change what Claude reviews
 
-Edit `src/prompt.md`. This is the prompt template sent to Claude with every review. The default focuses on correctness, security, performance, and actionable suggestions — but you can tune it for your team's priorities.
+Edit `src/prompt.md`. This is the prompt template sent to Claude for each review. 
 
 Available template variables: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{diff}`.
 
