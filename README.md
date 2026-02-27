@@ -75,10 +75,11 @@ just destroy yes               # Tear everything down
 2. **Signature verification** — the agent validates the HMAC-SHA256 signature; forged requests are rejected
 3. **Draft filtering** — draft PRs are skipped
 4. **Diff retrieval** — fetches edited files using the GitHub CLI
-5. **Smart truncation** — if truncation is necssary to fit context, lockfiles and generated code are dropped first
-6. **Claude reviews** — Customizable prompt drives review mechanics
-7. **Comment posted** — the review appears as a PR comment within 1–2 minutes
-8. **Force-push handling** — prior reviews are collapsed under a `<details>` tag; ongoing reviews are restarted
+5. **Full file context** — fetches complete contents of changed files via the GitHub API for richer review context
+6. **Smart truncation** — if truncation is necessary to fit context, lockfiles and generated code are dropped first
+7. **Claude reviews** — Customizable prompt drives review mechanics
+8. **Comment posted** — the review appears as a PR comment within 1–2 minutes
+9. **Force-push handling** — prior reviews are collapsed under a `<details>` tag; ongoing reviews are restarted
 
 ### Smart diff truncation
 
@@ -99,7 +100,7 @@ A note is added to the review listing which files were omitted.
 
 Edit `src/prompt.md`. This is the prompt template sent to Claude for each review. 
 
-Available template variables: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{diff}`.
+Available template variables: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{file_contents}`, `{diff}`.
 
 ### Configuration
 
@@ -108,6 +109,8 @@ Available template variables: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`
 | Review prompt | `src/prompt.md` | Correctness + security + performance |
 | Concurrent reviews | `MAX_WORKERS` in `.env` | 4 |
 | Diff size limit | `max_chars` in `smart_truncate_diff()` | 40,000 chars |
+| File contents limit | `MAX_FILE_CHARS` in `.env` | 80,000 chars |
+| Debounce delay | `DEBOUNCE_SECONDS` in `.env` | 10 seconds |
 | Low-priority file patterns | `LOW_PRIORITY_PATTERNS` in `src/agent.py` | Lockfiles, generated, vendor, SVGs |
 
 ---
@@ -132,6 +135,8 @@ infra/
 tests/
   test_agent.py          # Unit tests
   test_provision.py      # Provisioning tests
+  test_status.py         # Status command tests
+  conftest.py            # Pytest fixtures
 Justfile                 # All commands: build, test, deploy, provision, destroy
 .env.example             # Configuration template
 ```
