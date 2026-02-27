@@ -1,117 +1,189 @@
-# Automated PR Reviews with Claude Code
+# Claude Review Server
 
-A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated in your GitHub org, the agent posts a concise, actionable review comment within a couple of minutes.
+**Automatic, intelligent PR reviews on every push — powered by your Claude Code subscription.**
 
-## What it does
-
-- Listens for GitHub webhook events on PR open and push
-- Fetches the diff via the GitHub CLI
-- Sends it to Claude Code for review
-- Posts the review as a PR comment
-- Collapses old reviews when a PR is force-pushed
-- Skips draft PRs
-- Smart diff truncation — drops lockfiles and generated code first when diffs are large
-
-## Architecture
+Open a pull request, get a thoughtful code review in under two minutes. No SaaS, no per-seat pricing, no sending your code to a third party. Just Claude, running on a $4/month server you control.
 
 ```
-GitHub webhook → Cloudflare Tunnel (TLS) → cloudflared → Caddy (reverse proxy) → Python agent → Claude Code CLI → gh pr comment
+GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code → PR comment
 ```
 
-## Project structure
+---
 
-```
-src/
-  agent.py               # Webhook listener + review logic
-  prompt.md              # Review prompt template (customize this!)
-infra/
-  cloud-init.tmpl.yaml   # Cloud-init template with {{FILE:...}} markers
-  Caddyfile.origin-ca    # Caddy TLS config for custom domain setup
-scripts/
-  build.py               # Assembles cloud-init.yaml from template + source files
-tests/
-  test_agent.py          # Unit tests
-Justfile                 # Build, test, and deploy commands
-pyproject.toml           # Python project config (dev deps via uv)
-.env.example             # Copy to .env, fill in your values
-```
+## What you get
 
-## Prerequisites
+When someone opens or updates a PR in your org, the agent reads the diff and posts a review like this:
 
-- **Hetzner Cloud account** (or any VPS — adjust cloud-init as needed)
-- **Cloudflare account** (free tier works — used for tunnel or DNS)
-- **GitHub org** with permission to create org-level webhooks
-- **Claude Code subscription** (Pro or Max) for `claude setup-token`
-- **SSH key** added to your Hetzner account
-- [**just**](https://github.com/casey/just) command runner
-- [**uv**](https://docs.astral.sh/uv/) (for running tests)
+> ## Review
+>
+> 1. **SQL injection risk** — `query.build()` on line 42 interpolates user input directly. Use parameterized queries instead.
+> 2. **Missing error handling** — the `/api/submit` endpoint doesn't catch `TimeoutError`, which will crash the worker.
+> 3. **Nice refactor** — extracting the validation logic into `validate_input()` makes this much easier to test.
+>
+> ---
+> *Automated review by Claude Code*
 
-## Cost
+When someone force-pushes, old reviews are automatically collapsed so the conversation stays clean.
 
-~$4/month for a CX11 server. Claude usage comes from your existing subscription.
+---
+
+## Why this exists
+
+|  | Claude Review Server | GitHub Copilot code review | Typical SaaS reviewers |
+|--|--|--|--|
+| **Cost** | ~$4/mo server + your existing Claude sub | $19/user/mo or higher | $15–50/user/mo |
+| **Privacy** | Code stays on your server | Sent to GitHub/Microsoft | Sent to third party |
+| **Customizable** | Edit one Markdown file to change the review focus | Limited configuration | Varies |
+| **Self-hosted** | Full control | No | Rarely |
 
 ---
 
 ## Quick start
 
-### 1. Clone and configure
+### One-command deploy
+
+Fill in your tokens, run one command, and the server provisions itself — Hetzner VM, Cloudflare Tunnel, GitHub webhook, everything.
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/plasticbeachllc/claude-review-server.git
 cd claude-review-server
 cp .env.example .env
-# Edit .env with your webhook secret and other settings
+# Fill in .env (see below)
+
+just provision
 ```
 
-### 2. Customize the review prompt (optional)
+That's it. Open a PR in your org to see it work.
 
-Edit `src/prompt.md` to change what Claude focuses on during reviews.
+### What goes in `.env`
 
-### 3. Build cloud-init.yaml
+| Variable | Where to get it |
+|----------|----------------|
+| `HCLOUD_TOKEN` | [Hetzner Cloud Console](https://console.hetzner.cloud/) → API tokens |
+| `GH_TOKEN` | GitHub → Settings → Developer settings → Personal access tokens (needs `admin:org_hook` scope) |
+| `CLAUDE_CODE_AUTH_TOKEN` | Run `claude setup-token` locally |
+| `CF_API_TOKEN` | [Cloudflare dashboard](https://dash.cloudflare.com/profile/api-tokens) → Create token (Zone:DNS:Edit + Account:Cloudflare Tunnel:Edit) |
+| `CF_ACCOUNT_ID` | Cloudflare dashboard → any domain → Overview sidebar |
+| `CF_ZONE_ID` | Same page as account ID |
+| `TUNNEL_HOSTNAME` | The public hostname you want (e.g. `pr-review.yourdomain.com`) |
+| `GITHUB_ORG` | Your GitHub org name |
+
+### Managing the server
+
+```bash
+just status                    # Health check + server info
+just deploy root@<server-ip>   # Push code changes, restart service
+just destroy yes               # Tear everything down
+```
+
+---
+
+## How it works
+
+1. **GitHub sends a webhook** when a PR is opened or updated
+2. **Signature verification** — the agent validates the HMAC-SHA256 signature; forged requests are rejected
+3. **Draft filtering** — draft PRs are skipped
+4. **Diff retrieval** — fetches the full diff via `gh pr diff`
+5. **Smart truncation** — if the diff exceeds 40K chars, lockfiles and generated code are dropped first so Claude reviews what matters most
+6. **Claude reviews** — the diff is sent to Claude Code CLI with a customizable prompt
+7. **Comment posted** — the review appears as a PR comment within 1–2 minutes
+8. **Force-push handling** — previous reviews are collapsed under a `<details>` tag
+
+### Smart diff truncation
+
+Large PRs don't break the system. The agent intelligently drops files in this order:
+
+1. Lockfiles (`package-lock.json`, `yarn.lock`, `Cargo.lock`, ...)
+2. Generated/minified code (`.min.js`, `.pb.go`, ...)
+3. Snapshots, SVGs, vendored code
+4. Remaining files by size (largest first)
+
+A note is added to the review listing which files were omitted.
+
+---
+
+## Customization
+
+### Change what Claude reviews
+
+Edit `src/prompt.md`. This is the prompt template sent to Claude with every review. The default focuses on correctness, security, performance, and actionable suggestions — but you can tune it for your team's priorities.
+
+Available template variables: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{diff}`.
+
+### Configuration
+
+| Setting | Where | Default |
+|---------|-------|---------|
+| Review prompt | `src/prompt.md` | Correctness + security + performance |
+| Concurrent reviews | `MAX_WORKERS` in `.env` | 4 |
+| Diff size limit | `max_chars` in `smart_truncate_diff()` | 40,000 chars |
+| Low-priority file patterns | `LOW_PRIORITY_PATTERNS` in `src/agent.py` | Lockfiles, generated, vendor, SVGs |
+
+---
+
+## Project structure
+
+```
+src/
+  agent.py               # Webhook listener + review logic (~340 lines)
+  prompt.md              # Review prompt template — edit this!
+scripts/
+  provision.py           # One-command server provisioning
+  destroy.py             # Clean teardown of all resources
+  status.py              # Health + status checks
+  build.py               # Assembles cloud-init.yaml from template
+infra/
+  cloud-init.tmpl.yaml   # Server provisioning template
+  Caddyfile.origin-ca    # TLS config for custom domain setup
+tests/
+  test_agent.py          # Unit tests
+Justfile                 # All commands: build, test, deploy, provision, destroy
+.env.example             # Configuration template
+```
+
+---
+
+## Alternative: manual setup
+
+If you'd rather provision the server yourself (or use a different cloud provider), you can set things up step by step.
+
+<details>
+<summary>Manual setup instructions</summary>
+
+### 1. Build cloud-init.yaml
 
 ```bash
 just build
 ```
 
-This assembles `cloud-init.yaml` from the template and your source files. The built file is gitignored — it's a build artifact.
+### 2. Create a server
 
-### 4. Create the Hetzner server
+Use any VPS with Ubuntu 24.04. Paste the contents of `cloud-init.yaml` as the cloud-init user data.
 
-1. Go to [Hetzner Cloud Console](https://console.hetzner.cloud/) → **Create Server**
-2. Select Ubuntu 24.04, CX11, your SSH key
-3. Under **Cloud config**, paste the contents of your built `cloud-init.yaml`
-4. Create the server and note the IPv4 address
+Wait 3–5 minutes for provisioning to complete.
 
-Wait 3–5 minutes for cloud-init to finish (watch the CPU graph in Hetzner console).
+### 3. Set up a Cloudflare Tunnel
 
-### 5. Set up a Cloudflare Tunnel
-
-This gives you a public HTTPS URL without opening any inbound ports or managing certificates.
-
-1. In Cloudflare dashboard → **Zero Trust → Networks → Tunnels**
-2. Click **Create a tunnel**, choose **Cloudflared**, name it (e.g. `pr-review`)
-3. Copy the install/run command — it includes your tunnel token
-4. SSH into your server and run the install command:
+1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a tunnel**
+2. Choose **Cloudflared**, name it (e.g. `pr-review`)
+3. SSH into your server and install cloudflared:
 
 ```bash
 ssh root@<server-ip>
-
-# Add Cloudflare's GPG key and APT repo
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflared.list
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+  | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] \
+  https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
+  | tee /etc/apt/sources.list.d/cloudflared.list
 apt-get update && apt-get install -y cloudflared
-
-# Install the tunnel as a service using the token Cloudflare gave you
 cloudflared service install <YOUR_TUNNEL_TOKEN>
 ```
 
-5. Back in the Cloudflare dashboard, add a **Public Hostname** for the tunnel:
-   - **Subdomain:** `pr-review` (or whatever you like)
-   - **Domain:** pick any domain on your Cloudflare account, or use the generated `*.cfargotunnel.com` URL
-   - **Service:** `http://localhost:80` (Caddy handles the rest)
-6. Note the resulting public URL (e.g. `https://pr-review.yourdomain.com`)
+4. In the Cloudflare dashboard, add a public hostname:
+   - **Service:** `http://localhost:80`
+   - **Subdomain/Domain:** whatever you want (e.g. `pr-review.yourdomain.com`)
 
-### 6. Configure the server
+### 4. Configure the server
 
 ```bash
 ssh root@<server-ip>
@@ -119,128 +191,98 @@ ssh root@<server-ip>
 # Authenticate GitHub CLI
 sudo -u review gh auth login
 
-# Authenticate Claude Code (token is stored in ~review/.claude/)
+# Authenticate Claude Code
 sudo -u review claude
 
 # Start the agent
 systemctl start pr-review
 
-# Verify locally
+# Verify
 curl http://localhost:8080/health
-# → {"status":"healthy"}
-
-# Verify end-to-end through the tunnel
-curl https://<your-tunnel-hostname>/health
 # → {"status":"healthy"}
 ```
 
-### 7. Create the GitHub webhook
+### 5. Create the GitHub webhook
 
 1. GitHub org → **Settings → Webhooks → Add webhook**
-2. **Payload URL:** `https://<your-tunnel-hostname>/webhook`
+2. **Payload URL:** `https://<your-hostname>/webhook`
 3. **Content type:** `application/json`
-4. **Secret:** `grep WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2`
+4. **Secret:** your `GITHUB_WEBHOOK_SECRET` from `.env`
 5. **Events:** Pull requests only
-6. Check **Recent Deliveries** for a `200` response
 
-### 8. Test it
+### 6. Test it
 
-Open a PR on any repo in your org. You should see a review comment within 1–2 minutes.
+Open a PR. You should see a review comment within 1–2 minutes.
 
----
+</details>
 
-## Alternative: Custom domain with Origin CA
+<details>
+<summary>Custom domain with Origin CA (instead of Tunnel)</summary>
 
-If you already have a domain on Cloudflare and prefer to use an Origin CA certificate instead of a tunnel, replace step 5 above with:
+If you prefer a direct connection with Cloudflare Origin CA certificates:
 
-### 5a. Create the Cloudflare Origin CA certificate
-
-1. In Cloudflare dashboard → your domain → **SSL/TLS → Origin Server**
-2. Click **Create Certificate**, set hostname to your subdomain (e.g. `pr-review.yourdomain.com`)
-3. Copy both the certificate and private key (the key is only shown once)
-4. Under **SSL/TLS → Overview**, set encryption mode to **Full (Strict)**
-
-### 5b. Point your domain at the server
-
-In Cloudflare DNS, add an A record:
-
-| Type | Name         | Content         | Proxy   |
-|------|--------------|-----------------|---------|
-| A    | `pr-review`  | `<server IPv4>` | Proxied |
-
-### 5c. Configure the server for TLS
-
-Save the certificate and private key from step 5a to local files, then run:
+1. Cloudflare → your domain → **SSL/TLS → Origin Server → Create Certificate**
+2. Set hostname to your subdomain, copy the cert and key
+3. Set SSL mode to **Full (Strict)**
+4. Add a proxied A record pointing to your server IP
+5. Deploy the certs:
 
 ```bash
 just setup-tls root@<server-ip> origin.pem origin-key.pem
 ```
 
-This deploys the TLS Caddyfile, installs the certs with correct permissions, opens port 443, and restarts Caddy.
-
-Then continue with step 6 (configure the server) as normal.
+</details>
 
 ---
 
 ## Commands
 
-```bash
-just build                                    # Assemble cloud-init.yaml from template + sources
-just test                                     # Run tests (via uv)
-just deploy user@host                         # SCP source files to server and restart
-just setup-tls host cert key                  # Configure Origin CA TLS (custom domain only)
-just clean                                    # Remove built cloud-init.yaml
-```
-
-## Updating a running server
-
-After editing `src/agent.py` or `src/prompt.md`:
-
-```bash
-just deploy root@<server-ip>
-```
-
-This copies the files and restarts the service. No need to rebuild cloud-init.yaml unless you're provisioning a new server.
-
-## Customization
-
-### Review prompt
-
-Edit `src/prompt.md`. The template uses Python format strings: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{diff}`.
-
-### Diff size limit
-
-The `max_chars` parameter in `smart_truncate_diff` defaults to 40,000 characters. Increase for more coverage at the cost of slower reviews.
-
-### Concurrent reviews
-
-Set `MAX_WORKERS` in `.env` (default: 4).
-
-### Low-priority file patterns
-
-Edit `LOW_PRIORITY_PATTERNS` in `src/agent.py` to control which files get dropped first when diffs are truncated. Defaults: lockfiles, generated code, snapshots, SVGs, vendored code.
+| Command | What it does |
+|---------|-------------|
+| `just provision` | Create server + tunnel + webhook (fully automated) |
+| `just status` | Check server health and status |
+| `just deploy root@host` | Push code changes to a running server |
+| `just build` | Assemble cloud-init.yaml from template |
+| `just test` | Run unit tests |
+| `just setup-tls host cert key` | Configure Origin CA TLS |
+| `just destroy yes` | Tear down server + tunnel + webhook + DNS |
+| `just clean` | Remove built cloud-init.yaml |
 
 ---
 
 ## Troubleshooting
 
-**Webhook returns 404** — The agent only responds to `POST /webhook` and `GET /health`.
+| Problem | Fix |
+|---------|-----|
+| Webhook returns 404 | The agent only responds to `POST /webhook` and `GET /health` |
+| Agent won't start | `journalctl -u pr-review --no-pager -n 30` — usually a missing env var |
+| Claude auth errors | `sudo -u review claude` to re-authenticate, then `systemctl restart pr-review` |
+| Reviews aren't posting | Verify gh access: `sudo -u review gh pr list --repo your-org/some-repo` |
+| Tunnel not connecting | `systemctl status cloudflared` and check Cloudflare Zero Trust dashboard |
 
-**Agent won't start** — Check `journalctl -u pr-review --no-pager -n 30`. Common cause: missing `GITHUB_WEBHOOK_SECRET` in `.env`.
+---
 
-**Claude auth errors** — Re-run `sudo -u review claude` to re-authenticate (token is stored in `~review/.claude/`), then `systemctl restart pr-review`.
+## Prerequisites
 
-**Caddy won't start** — Check cert permissions: `origin.pem` should be 644, `origin-key.pem` should be 600 owned by `caddy:caddy`.
+- [**just**](https://github.com/casey/just) command runner
+- [**uv**](https://docs.astral.sh/uv/) (for running scripts and tests)
+- A **Claude Code subscription** (Pro or Max)
+- A **Hetzner Cloud** account (or any VPS — adjust cloud-init as needed)
+- A **Cloudflare** account (free tier works)
+- A **GitHub org** with permission to create org-level webhooks
 
-**Tunnel not connecting** — Check `systemctl status cloudflared` and verify the tunnel is active in the Cloudflare Zero Trust dashboard.
+---
 
-**Reviews aren't posting** — Verify gh access: `sudo -u review gh pr list --repo your-org/some-repo`.
+## Security
 
-## Maintenance
+- **No inbound ports** — Cloudflare Tunnel connects outbound; no ports are opened on the server
+- **HMAC signature verification** — every webhook payload is cryptographically verified
+- **Isolated service user** — the agent runs as an unprivileged `review` user, not root
+- **Systemd hardening** — `ProtectSystem=strict`, `PrivateTmp=yes`, restricted capabilities
+- **Token isolation** — auth tokens are stored with proper permissions in `~review/.claude/`
 
-| Task | Frequency | How |
-|------|-----------|-----|
-| Renew Claude token | Yearly | `claude setup-token`, update `.env`, restart |
-| Renew Origin CA cert | 15 years | Regenerate in Cloudflare, replace cert files (custom domain only) |
-| Update Claude Code | As needed | Bump version in `infra/cloud-init.tmpl.yaml`, `just build` |
-| System packages | Monthly | `apt update && apt upgrade` |
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
