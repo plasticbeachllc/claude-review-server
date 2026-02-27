@@ -14,6 +14,7 @@ Usage:
 """
 
 import base64
+import os
 import re
 import secrets
 import subprocess
@@ -52,12 +53,141 @@ from destroy import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # SSH key management
 # ---------------------------------------------------------------------------
-def find_local_pubkey() -> str:
+def _query_agent(sock: str | None = None) -> list[str]:
+    """Query an SSH agent for its public keys.
+
+    If *sock* is provided it is passed via ``SSH_AUTH_SOCK``; otherwise
+    the default agent (whatever ``SSH_AUTH_SOCK`` already points to) is
+    used.  Returns a list of key lines (one per key), or an empty list.
+    """
+    env = None
+    if sock:
+        env = {**os.environ, "SSH_AUTH_SOCK": sock}
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-L"], capture_output=True, text=True,
+            timeout=5, env=env,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return []
+
+
+def _identity_agent_from_ssh_config() -> str | None:
+    """Parse ``~/.ssh/config`` for an ``IdentityAgent`` directive.
+
+    Returns the expanded socket path, or ``None`` if not configured.
+    Handles tilde (``~/...``) expansion.
+    """
+    config_path = Path.home() / ".ssh" / "config"
+    if not config_path.exists():
+        return None
+    try:
+        for line in config_path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("identityagent"):
+                _, _, value = stripped.partition(" ")
+                value = value.strip().strip('"')
+                if value.startswith("~/"):
+                    value = str(Path.home() / value[2:])
+                if Path(value).exists():
+                    return value
+    except OSError:
+        pass
+    return None
+
+
+def _collect_agent_keys() -> list[tuple[str, str]]:
+    """Collect all keys from available SSH agents.
+
+    Returns a list of ``(label, key_line)`` tuples.
+    """
+    results: list[tuple[str, str]] = []
+    agents: list[tuple[str, str | None]] = [
+        ("default agent", None),
+    ]
+    identity_agent = _identity_agent_from_ssh_config()
+    if identity_agent:
+        agents.append(("IdentityAgent (SSH config)", identity_agent))
+
+    for label, sock in agents:
+        for key_line in _query_agent(sock):
+            results.append((label, key_line))
+    return results
+
+
+def _match_key_by_comment(keys: list[tuple[str, str]], comment: str) -> str | None:
+    """Find a key whose comment field matches the given string.
+
+    Comparison is case-insensitive.  Returns the key line or ``None``.
+    """
+    needle = comment.lower()
+    for _label, key_line in keys:
+        parts = key_line.split(None, 2)
+        key_comment = parts[2] if len(parts) >= 3 else ""
+        if key_comment.lower() == needle:
+            return key_line
+    return None
+
+
+def find_local_pubkey(config: dict | None = None) -> str:
     """Find the user's SSH public key. Returns the public key content.
 
-    Checks standard file paths first, then falls back to the SSH agent
-    (``ssh-add -L``) for users with keys stored under non-standard paths.
+    If ``config`` contains an ``SSH_KEY`` value, it is used to select
+    the key explicitly:
+
+    * **File path** (contains ``/`` or ends with ``.pub``): read the
+      file directly.  Tilde expansion is applied.
+    * **Comment string** (anything else): match against the comment
+      field of keys from all available SSH agents.
+
+    Without ``SSH_KEY`` the function auto-discovers keys in this order:
+
+    1. Standard file paths (``~/.ssh/id_{ed25519,ecdsa,rsa}.pub``)
+    2. Default SSH agent (``SSH_AUTH_SOCK``)
+    3. ``IdentityAgent`` from ``~/.ssh/config`` (1Password, Secretive, …)
     """
+    ssh_key_hint = (config or {}).get("SSH_KEY", "").strip()
+
+    # ── Explicit selection via SSH_KEY ──────────────────────────────
+    if ssh_key_hint:
+        is_path = "/" in ssh_key_hint or ssh_key_hint.endswith(".pub")
+        if is_path:
+            # Treat as file path
+            expanded = ssh_key_hint
+            if expanded.startswith("~/"):
+                expanded = str(Path.home() / expanded[2:])
+            path = Path(expanded)
+            if not path.is_file():
+                raise ProvisionError(f"SSH_KEY file not found: {path}")
+            pubkey = path.read_text().strip()
+            print(f"  Using SSH key from file: {path}")
+            return pubkey
+        else:
+            # Treat as agent key comment
+            agent_keys = _collect_agent_keys()
+            key_line = _match_key_by_comment(agent_keys, ssh_key_hint)
+            if key_line:
+                print(f"  Using SSH key matching comment: {ssh_key_hint}")
+                return key_line
+            # List available comments to help the user
+            available = []
+            for _label, kl in agent_keys:
+                parts = kl.split(None, 2)
+                if len(parts) >= 3:
+                    available.append(parts[2])
+            hint = ""
+            if available:
+                hint = "\n  Available keys:\n" + "\n".join(
+                    f"    - {c}" for c in available
+                )
+            raise ProvisionError(
+                f"No SSH key found with comment matching '{ssh_key_hint}'.{hint}"
+            )
+
+    # ── Auto-discovery ─────────────────────────────────────────────
     candidates = [
         Path.home() / ".ssh" / "id_ed25519.pub",
         Path.home() / ".ssh" / "id_ecdsa.pub",
@@ -67,24 +197,20 @@ def find_local_pubkey() -> str:
         if path.exists():
             return path.read_text().strip()
 
-    # Fallback: check SSH agent for loaded keys
-    try:
-        result = subprocess.run(
-            ["ssh-add", "-L"], capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            key_line = result.stdout.strip().splitlines()[0]
-            # Show which key was selected so the user can verify
-            parts = key_line.split()
-            key_comment = parts[2] if len(parts) >= 3 else "(no comment)"
-            print(f"  Using SSH key from agent: {parts[0]} {key_comment}")
-            return key_line
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    # Fallback: first key from any available agent
+    agent_keys = _collect_agent_keys()
+    if agent_keys:
+        label, key_line = agent_keys[0]
+        parts = key_line.split()
+        key_comment = parts[2] if len(parts) >= 3 else "(no comment)"
+        print(f"  Using SSH key from {label}: {parts[0]} {key_comment}")
+        return key_line
 
     raise ProvisionError(
         "No SSH public key found. Expected ~/.ssh/id_ed25519.pub, "
-        "~/.ssh/id_ecdsa.pub, or ~/.ssh/id_rsa.pub — or a key loaded in ssh-agent"
+        "~/.ssh/id_ecdsa.pub, or ~/.ssh/id_rsa.pub — or a key loaded in "
+        "ssh-agent / IdentityAgent (1Password, Secretive, etc.). "
+        "You can also set SSH_KEY in .env to select a specific key."
     )
 
 
@@ -452,7 +578,7 @@ def main():
 
         # 3. SSH key
         print("[3/8] Setting up SSH key...")
-        pubkey = find_local_pubkey()
+        pubkey = find_local_pubkey(config)
         client = Client(token=config["HCLOUD_TOKEN"])
         ssh_key, key_created = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
         if key_created:

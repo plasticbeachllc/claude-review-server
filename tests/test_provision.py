@@ -196,6 +196,119 @@ class TestFindLocalPubkey:
             with pytest.raises(ProvisionError, match="No SSH public key"):
                 find_local_pubkey()
 
+    def test_ssh_key_file_path(self, tmp_path):
+        from provision import find_local_pubkey
+
+        key_file = tmp_path / "custom_key.pub"
+        key_file.write_text("ssh-ed25519 AAAA... custom@host")
+
+        content = find_local_pubkey({"SSH_KEY": str(key_file)})
+        assert content == "ssh-ed25519 AAAA... custom@host"
+
+    def test_ssh_key_file_with_tilde(self, tmp_path):
+        from provision import find_local_pubkey
+
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "my_key.pub").write_text("ssh-ed25519 AAAA... tilde@host")
+
+        with patch("provision.Path.home", return_value=tmp_path):
+            content = find_local_pubkey({"SSH_KEY": "~/.ssh/my_key.pub"})
+        assert content == "ssh-ed25519 AAAA... tilde@host"
+
+    def test_ssh_key_file_not_found(self, tmp_path):
+        from _common import ProvisionError
+        from provision import find_local_pubkey
+
+        with pytest.raises(ProvisionError, match="SSH_KEY file not found"):
+            find_local_pubkey({"SSH_KEY": str(tmp_path / "nope.pub")})
+
+    def test_ssh_key_comment_match(self):
+        from provision import find_local_pubkey
+
+        agent_keys = [
+            ("agent", "ssh-ed25519 AAAA1 Hetzner - Plane"),
+            ("agent", "ssh-ed25519 AAAA2 Hetzner - Webhooks"),
+            ("agent", "ssh-ed25519 AAAA3 DigitalOcean"),
+        ]
+        with patch("provision._collect_agent_keys", return_value=agent_keys):
+            content = find_local_pubkey({"SSH_KEY": "Hetzner - Webhooks"})
+        assert content == "ssh-ed25519 AAAA2 Hetzner - Webhooks"
+
+    def test_ssh_key_comment_case_insensitive(self):
+        from provision import find_local_pubkey
+
+        agent_keys = [
+            ("agent", "ssh-ed25519 AAAA1 My Server Key"),
+        ]
+        with patch("provision._collect_agent_keys", return_value=agent_keys):
+            content = find_local_pubkey({"SSH_KEY": "my server key"})
+        assert content == "ssh-ed25519 AAAA1 My Server Key"
+
+    def test_ssh_key_comment_no_match(self):
+        from _common import ProvisionError
+        from provision import find_local_pubkey
+
+        agent_keys = [
+            ("agent", "ssh-ed25519 AAAA1 Hetzner - Plane"),
+            ("agent", "ssh-ed25519 AAAA2 DigitalOcean"),
+        ]
+        with patch("provision._collect_agent_keys", return_value=agent_keys):
+            with pytest.raises(ProvisionError, match="No SSH key found with comment"):
+                find_local_pubkey({"SSH_KEY": "NonExistent Key"})
+
+    def test_ssh_key_comment_no_match_lists_available(self):
+        from _common import ProvisionError
+        from provision import find_local_pubkey
+
+        agent_keys = [
+            ("agent", "ssh-ed25519 AAAA1 Hetzner - Plane"),
+            ("agent", "ssh-ed25519 AAAA2 DigitalOcean"),
+        ]
+        with patch("provision._collect_agent_keys", return_value=agent_keys):
+            with pytest.raises(ProvisionError, match="Hetzner - Plane"):
+                find_local_pubkey({"SSH_KEY": "NonExistent Key"})
+
+    def test_ssh_key_empty_string_triggers_auto_discovery(self, tmp_path):
+        from provision import find_local_pubkey
+
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "id_ed25519.pub").write_text("ssh-ed25519 AAAA... auto@host")
+
+        with patch("provision.Path.home", return_value=tmp_path):
+            content = find_local_pubkey({"SSH_KEY": ""})
+        assert content == "ssh-ed25519 AAAA... auto@host"
+
+    def test_auto_discovery_picks_first_agent_key(self, tmp_path):
+        from provision import find_local_pubkey
+
+        agent_keys = [
+            ("IdentityAgent (SSH config)", "ssh-ed25519 AAAA1 First Key"),
+            ("IdentityAgent (SSH config)", "ssh-ed25519 AAAA2 Second Key"),
+        ]
+        with (
+            patch("provision.Path.home", return_value=tmp_path),
+            patch("provision._collect_agent_keys", return_value=agent_keys),
+        ):
+            content = find_local_pubkey()
+        assert content == "ssh-ed25519 AAAA1 First Key"
+
+    def test_file_path_takes_priority_over_auto_discovery(self, tmp_path):
+        """SSH_KEY file path should be used even if standard keys exist."""
+        from provision import find_local_pubkey
+
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "id_ed25519.pub").write_text("ssh-ed25519 DEFAULT default@host")
+
+        custom = tmp_path / "custom.pub"
+        custom.write_text("ssh-ed25519 CUSTOM custom@host")
+
+        with patch("provision.Path.home", return_value=tmp_path):
+            content = find_local_pubkey({"SSH_KEY": str(custom)})
+        assert content == "ssh-ed25519 CUSTOM custom@host"
+
 
 # ── Cloudflare API request construction ────────────────────
 
