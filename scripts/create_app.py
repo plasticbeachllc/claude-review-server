@@ -21,6 +21,7 @@ Usage:
 
 import html
 import json
+import os
 import secrets
 import socket
 import sys
@@ -61,7 +62,11 @@ def _read_env(path: Path) -> dict[str, str]:
 
 
 def _upsert_env(path: Path, updates: dict[str, str]):
-    """Add or update keys in a .env file, preserving comments and order."""
+    """Add or update keys in a .env file, preserving comments and order.
+
+    Uses atomic write (temp file + rename) to avoid partial writes if
+    the process is interrupted mid-write.
+    """
     lines: list[str] = []
     existing_keys: set[str] = set()
 
@@ -81,7 +86,9 @@ def _upsert_env(path: Path, updates: dict[str, str]):
         if key not in existing_keys:
             lines.append(f"{key}={value}")
 
-    path.write_text("\n".join(lines) + "\n")
+    tmp = path.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +109,15 @@ class _ManifestHandler(BaseHTTPRequestHandler):
             # Serve the auto-submitting form page
             self._serve_form()
         elif parsed.path == "/callback":
-            # GitHub redirects here with ?code=...
+            # GitHub redirects here with ?code=...&state=...
             params = parse_qs(parsed.query)
+            states = params.get("state", [])
+            expected = getattr(self.server, "expected_state", None)
+            if expected and (not states or states[0] != expected):
+                self.server.callback_error = "Invalid state parameter"  # type: ignore[attr-defined]
+                self.server.callback_event.set()  # type: ignore[attr-defined]
+                self._respond(400, "Error: invalid state parameter.")
+                return
             codes = params.get("code", [])
             if codes:
                 self.server.callback_code = codes[0]  # type: ignore[attr-defined]
@@ -188,6 +202,7 @@ def create_app(root: Path) -> dict:
         sys.exit(1)
 
     port = _find_free_port()
+    state = secrets.token_hex(16)
     webhook_url = f"https://{hostname}/webhook"
 
     # Random suffix avoids name collisions if re-creating the app.
@@ -203,7 +218,7 @@ def create_app(root: Path) -> dict:
             "url": webhook_url,
             "active": True,
         },
-        "redirect_url": f"http://localhost:{port}/callback",
+        "redirect_url": f"http://localhost:{port}/callback?state={state}",
         "default_permissions": {
             "contents": "read",
             "pull_requests": "write",
@@ -216,6 +231,7 @@ def create_app(root: Path) -> dict:
     server = HTTPServer(("127.0.0.1", port), _ManifestHandler)
     server.manifest = manifest  # type: ignore[attr-defined]
     server.org = org  # type: ignore[attr-defined]
+    server.expected_state = state  # type: ignore[attr-defined]
 
     print(f"[1/4] Starting local server on http://localhost:{port}")
     print(f"  Opening browser to create GitHub App for org '{org}'...")
@@ -282,10 +298,11 @@ def create_app(root: Path) -> dict:
         )
         sys.exit(1)
 
-    # Save PEM file
+    # Save PEM file (create with restricted permissions from the start)
     pem_path = root / PEM_FILENAME
-    pem_path.write_text(pem)
-    pem_path.chmod(0o600)
+    fd = os.open(pem_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(pem)
     print(f"  Saved private key to {PEM_FILENAME}")
 
     # Update .env
@@ -306,8 +323,10 @@ def create_app(root: Path) -> dict:
     if not webbrowser.open(install_url):
         print(f"\n  No browser found. Open this URL manually:\n  {install_url}")
 
-    # Poll for the installation
+    # Poll for the installation.  Generate JWT once (valid for 10 min,
+    # well within the 5-minute poll window) instead of per-iteration.
     print("  Waiting for installation...", end="", flush=True)
+    jwt = generate_jwt(app_id, str(pem_path))
     deadline = time.time() + 300
     installation_id = None
 
@@ -315,7 +334,6 @@ def create_app(root: Path) -> dict:
         time.sleep(3)
         print(".", end="", flush=True)
         try:
-            jwt = generate_jwt(app_id, str(pem_path))
             resp = requests.get(
                 f"{GH_API}/app/installations",
                 headers={

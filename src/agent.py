@@ -172,11 +172,14 @@ def _get_installation_token() -> str:
             f"Unexpected token response (missing {e}): {data}"
         ) from e
 
-    # Parse expiry and store under lock.
+    # Parse expiry and store under lock.  Re-check in case another thread
+    # already refreshed while we were doing the HTTP exchange.
     expires_at = datetime.fromisoformat(
         expires_str.replace("Z", "+00:00")
     )
     with _token_lock:
+        if _token_cache.token and time.time() < (_token_cache.expires_at - 300):
+            return _token_cache.token  # another thread already refreshed
         _token_cache.token = token
         _token_cache.expires_at = expires_at.timestamp()
     log.info("Refreshed GitHub App installation token")
