@@ -7,12 +7,14 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import quote
 
 # ── Structured JSON logging ──────────────────────────────
 class JSONFormatter(logging.Formatter):
@@ -39,6 +41,7 @@ except KeyError:
     sys.exit("GITHUB_WEBHOOK_SECRET not set — add it to /opt/pr-review/.env")
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
+MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
@@ -56,7 +59,8 @@ def get_prompt_template() -> str:
 
 # Files to drop first when truncating large diffs
 LOW_PRIORITY_PATTERNS = [
-    r"(package-lock|yarn\.lock|pnpm-lock|Cargo\.lock|go\.sum|composer\.lock)",
+    r"(package-lock|yarn\.lock|pnpm-lock|Cargo\.lock|go\.sum|composer\.lock|"
+    r"uv\.lock|poetry\.lock|Pipfile\.lock|Gemfile\.lock|bun\.lockb)",
     r"\.(generated|min)\.(js|css|ts)$",
     r"__snapshots__/",
     r"\.svg$",
@@ -65,9 +69,19 @@ LOW_PRIORITY_PATTERNS = [
 ]
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+PORT = int(os.environ.get("PORT", "8080"))
+DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "30"))
+MAX_COMMENT_CHARS = 65_000  # GitHub comment limit is 65536
 
 # Regex for extracting the filename from "diff --git a/path b/path"
 DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+# Debounce tracking: maps "repo#number" -> Timer.
+# When a new event arrives, the previous timer is cancelled and a new one
+# is started.  This avoids consuming executor threads with sleeping workers.
+_debounce_timers: dict[str, threading.Timer] = {}
+_debounce_lock = threading.Lock()
+_shutting_down = threading.Event()
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -132,6 +146,117 @@ def smart_truncate_diff(diff: str, max_chars: int = 40_000) -> tuple[str, str]:
     return "".join(kept), note
 
 
+def extract_diff_filenames(diff: str) -> list[str]:
+    """Extract unique filenames from a unified diff, excluding deleted files."""
+    filenames: list[str] = []
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        m = DIFF_HEADER_RE.match(lines[i])
+        if m:
+            filename = m.group(2)
+            # Check next few lines for "deleted file mode" or "+++ /dev/null"
+            is_deleted = False
+            for j in range(i + 1, min(i + 6, len(lines))):
+                if lines[j].startswith("diff --git"):
+                    break
+                if "deleted file mode" in lines[j] or lines[j] == "+++ /dev/null":
+                    is_deleted = True
+                    break
+            if not is_deleted and filename not in filenames:
+                filenames.append(filename)
+        i += 1
+    return filenames
+
+
+def format_file_contents(
+    files: list[tuple[str, str]], max_chars: int = 80_000,
+) -> tuple[str, str]:
+    """Format file contents with priority-based truncation.
+
+    Returns (formatted_contents, truncation_note).
+
+    Note: the is_low_priority sort is intentionally kept even though
+    fetch_file_contents already filters low-priority files. This makes
+    format_file_contents safe for standalone use with arbitrary inputs.
+    """
+    if not files:
+        return "", ""
+
+    # Sort: high-priority first, then smaller files first (defensive —
+    # callers may pass unfiltered file lists)
+    sorted_files = sorted(files, key=lambda x: (is_low_priority(x[0]), len(x[1])))
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    total = 0
+    for name, content in sorted_files:
+        entry = f"### {name}\n~~~\n{content}\n~~~\n"
+        if total + len(entry) <= max_chars:
+            kept.append(entry)
+            total += len(entry)
+        else:
+            dropped.append(name)
+
+    note = ""
+    if dropped:
+        note = (
+            f"({len(dropped)} file(s) contents omitted: "
+            f"{', '.join(dropped[:10])}"
+            f"{'...' if len(dropped) > 10 else ''})"
+        )
+
+    return "".join(kept), note
+
+
+def fetch_file_contents(
+    repo: str, head_sha: str, filenames: list[str],
+) -> list[tuple[str, str]]:
+    """Fetch full file contents from the PR head ref via GitHub API.
+
+    Skips low-priority, binary, and oversized (>50 KB) files.
+    Fetches at most 15 files to limit API calls.
+    """
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        log.warning(f"Invalid repo format: {repo!r}")
+        return []
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        log.warning(f"Invalid head SHA format: {head_sha!r}")
+        return []
+
+    targets = [f for f in filenames if not is_low_priority(f)][:15]
+    files: list[tuple[str, str]] = []
+
+    for filename in targets:
+        encoded_path = quote(filename, safe="/")
+        # capture_output without text=True is intentional: we need raw
+        # bytes to detect binary content (null-byte check) before
+        # decoding as UTF-8.
+        result = subprocess.run(
+            ["gh", "api",
+             f"repos/{repo}/contents/{encoded_path}?ref={head_sha}",
+             "-H", "Accept: application/vnd.github.raw+json"],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            log.debug(f"Failed to fetch {filename} (rc={result.returncode})")
+            continue
+        # Decode as UTF-8; null bytes are a strong binary signal
+        content = result.stdout.decode("utf-8", errors="replace")
+        if not content:
+            log.debug(f"Skipping empty file: {filename}")
+            continue
+        if "\x00" in content[:8192]:
+            log.debug(f"Skipping binary file: {filename}")
+            continue
+        if len(content) > 50_000:
+            log.debug(f"Skipping oversized file ({len(content)} chars): {filename}")
+            continue
+        files.append((filename, content))
+
+    return files
+
+
 def already_reviewed(repo: str, pr_number: int) -> bool:
     """Check if we already posted a review comment on this PR."""
     result = subprocess.run(
@@ -187,6 +312,35 @@ def collapse_old_reviews(repo: str, pr_number: int):
         )
 
 
+def _schedule_debounced_review(repo: str, pr_number: int, pr_title: str,
+                               action: str):
+    """Schedule a review after the debounce window using threading.Timer.
+
+    Cancels any previously scheduled timer for the same PR so only the
+    last event in a burst actually triggers a review.  The timer fires
+    outside the executor, so sleeping doesn't consume worker slots.
+    """
+    key = f"{repo}#{pr_number}"
+
+    def _fire():
+        with _debounce_lock:
+            _debounce_timers.pop(key, None)
+        if _shutting_down.is_set():
+            log.info(f"Skipping debounced review for {key} (shutting down)")
+            return
+        executor.submit(review_pr, repo, pr_number, pr_title, action)
+
+    with _debounce_lock:
+        old = _debounce_timers.get(key)
+        if old is not None:
+            old.cancel()
+            log.info(f"Debounced {key} (superseded by newer event)")
+        timer = threading.Timer(DEBOUNCE_SECONDS, _fire)
+        timer.daemon = True
+        _debounce_timers[key] = timer
+        timer.start()
+
+
 def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
     """Fetch diff, invoke Claude, post review comment."""
     log.info(f"Reviewing {repo}#{pr_number}: {pr_title} ({action})")
@@ -207,18 +361,55 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             log.error(f"gh pr diff failed: {diff_result.stderr}")
             return
 
-        body_result = subprocess.run(
+        # Fetch PR metadata (body + head SHA) in one call
+        pr_info_result = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--repo", repo,
-             "--json", "body", "--jq", ".body"],
+             "--json", "body,headRefOid"],
             capture_output=True, text=True, timeout=30,
         )
-        pr_body = body_result.stdout.strip() if body_result.returncode == 0 else ""
+        pr_body = ""
+        head_sha = ""
+        if pr_info_result.returncode == 0:
+            try:
+                pr_info = json.loads(pr_info_result.stdout)
+                pr_body = pr_info.get("body", "").strip()
+                head_sha = pr_info.get("headRefOid", "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
 
         diff, truncation_note = smart_truncate_diff(diff_result.stdout)
 
         if not diff.strip():
             log.warning(f"Empty diff for {repo}#{pr_number}")
             return
+
+        # Fetch full contents of changed files for richer context
+        file_section = ""
+        if head_sha:
+            filenames = extract_diff_filenames(diff_result.stdout)
+            fetchable = [f for f in filenames if not is_low_priority(f)]
+            raw_files = fetch_file_contents(repo, head_sha, fetchable)
+            file_contents_str, file_note = format_file_contents(
+                raw_files, max_chars=MAX_FILE_CHARS,
+            )
+            # Surface the 15-file fetch cap if it was hit
+            notes = []
+            capped = len(fetchable) - 15
+            if capped > 0:
+                names = ", ".join(fetchable[15:25])
+                suffix = "..." if capped > 10 else ""
+                notes.append(
+                    f"({capped} file(s) exceeded 15-file fetch limit: "
+                    f"{names}{suffix})"
+                )
+            if file_note:
+                notes.append(file_note)
+
+            if file_contents_str:
+                parts = ["Full contents of changed files for context:"]
+                parts.extend(notes)
+                parts.append(file_contents_str)
+                file_section = "\n\n".join(parts)
 
         # Escape braces in untrusted content so .format() doesn't choke
         # on diffs/bodies containing {variable_name} patterns.
@@ -231,8 +422,11 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             pr_title=esc(pr_title),
             pr_body=esc(pr_body) or "(none)",
             truncation_note=truncation_note,
+            file_contents=esc(file_section),
             diff=esc(diff),
         )
+        # Collapse runs of blank lines left by empty placeholders
+        prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],
@@ -249,12 +443,21 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             return
 
         header = "🔄 Updated Review" if action == "synchronize" else "📝 Review"
+        footer = "\n\n---\n*Automated review by Claude Code*"
+
+        # Truncate if review would exceed GitHub's comment size limit
+        overhead = len(f"{REVIEW_MARKER}\n## {header}\n\n") + len(footer)
+        max_review = MAX_COMMENT_CHARS - overhead
+        if len(review_text) > max_review:
+            truncation_msg = "\n\n*(Review truncated — exceeded GitHub comment size limit)*"
+            review_text = review_text[:max_review - len(truncation_msg)] + truncation_msg
+            log.warning(f"Truncated review for {repo}#{pr_number} to fit comment limit")
+
         comment = (
             f"{REVIEW_MARKER}\n"
             f"## {header}\n\n"
-            f"{review_text}\n\n"
-            f"---\n"
-            f"*Automated review by Claude Code*"
+            f"{review_text}"
+            f"{footer}"
         )
 
         post_result = subprocess.run(
@@ -315,23 +518,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if event != "pull_request":
             return
 
-        data = json.loads(payload)
-        action = data.get("action")
-        if action not in ("opened", "synchronize"):
-            return
+        try:
+            data = json.loads(payload)
+            action = data.get("action")
+            if action not in ("opened", "synchronize"):
+                return
 
-        pr = data["pull_request"]
-        if pr.get("draft", False):
-            log.info(f"Skipping draft PR #{pr['number']}")
-            return
+            pr = data["pull_request"]
+            if pr.get("draft", False):
+                log.info(f"Skipping draft PR #{pr['number']}")
+                return
 
-        executor.submit(
-            review_pr,
-            data["repository"]["full_name"],
-            pr["number"],
-            pr["title"],
-            action,
-        )
+            repo = data["repository"]["full_name"]
+            number = pr["number"]
+            title = pr["title"]
+
+            # Debounce rapid force-pushes: delay "synchronize" events so
+            # only the last push in a burst actually triggers a review.
+            if action == "synchronize" and DEBOUNCE_SECONDS > 0:
+                _schedule_debounced_review(repo, number, title, action)
+            else:
+                executor.submit(review_pr, repo, number, title, action)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            log.error(f"Malformed webhook payload: {e}")
 
     def do_GET(self):
         if self.path == "/health":
@@ -349,8 +558,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("127.0.0.1", port), WebhookHandler)
-    log.info(f"PR Review Agent listening on 127.0.0.1:{port} "
+    server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
+
+    def _do_shutdown():
+        """Perform blocking shutdown work off the signal handler thread."""
+        _shutting_down.set()
+        # Cancel any pending debounce timers
+        with _debounce_lock:
+            for timer in _debounce_timers.values():
+                timer.cancel()
+            _debounce_timers.clear()
+        server.shutdown()
+        executor.shutdown(wait=True, cancel_futures=False)
+
+    def _shutdown(signum, _frame):
+        log.info(f"Received {signal.Signals(signum).name}, shutting down...")
+        threading.Thread(target=_do_shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    log.info(f"PR Review Agent listening on 127.0.0.1:{PORT} "
              f"(workers={MAX_WORKERS})")
     server.serve_forever()

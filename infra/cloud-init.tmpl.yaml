@@ -70,9 +70,9 @@ write_files:
       # Security hardening
       NoNewPrivileges=yes
       ProtectSystem=strict
-      ReadWritePaths=/opt/pr-review
+      ReadWritePaths=/opt/pr-review /home/review
       PrivateTmp=yes
-      ProtectHome=no              # Claude auth tokens live in ~review/.claude/
+      ProtectHome=no              # gh config + Claude auth tokens live in ~review/
       ProtectKernelTunables=yes
       ProtectKernelModules=yes
       ProtectControlGroups=yes
@@ -92,7 +92,8 @@ runcmd:
   - bash -o pipefail -c 'curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg'
   - echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
   - apt-get update && apt-get install -y nodejs
-  - npm install -g @anthropic-ai/claude-code@2.1.53
+  - npm install -g @anthropic-ai/claude-code@latest
+  - echo "Installed claude-code version:" && npm list -g @anthropic-ai/claude-code --depth=0
 
   # ── Install GitHub CLI ────────────────────────────────────
   - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -177,6 +178,7 @@ runcmd:
   # ── Enable services (don't start pr-review yet — needs auth) ──
   - systemctl daemon-reload
   - systemctl enable caddy
+  - systemctl restart caddy
   - systemctl enable pr-review
   - |
     echo ""

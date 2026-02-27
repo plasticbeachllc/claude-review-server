@@ -186,6 +186,9 @@ Then continue with step 6 (configure the server) as normal.
 
 ```bash
 just build                                    # Assemble cloud-init.yaml from template + sources
+just provision                                # Build + create server + configure (fully automated)
+just destroy yes                              # Tear down server + tunnel + webhook + DNS
+just status                                   # Check server health and service status
 just test                                     # Run tests (via uv)
 just deploy user@host                         # SCP source files to server and restart
 just setup-tls host cert key                  # Configure Origin CA TLS (custom domain only)
@@ -242,5 +245,5 @@ Edit `LOW_PRIORITY_PATTERNS` in `src/agent.py` to control which files get droppe
 |------|-----------|-----|
 | Renew Claude token | Yearly | `claude setup-token`, update `.env`, restart |
 | Renew Origin CA cert | 15 years | Regenerate in Cloudflare, replace cert files (custom domain only) |
-| Update Claude Code | As needed | Bump version in `infra/cloud-init.tmpl.yaml`, `just build` |
+| Update Claude Code | As needed | `ssh root@<ip> npm install -g @anthropic-ai/claude-code@latest && systemctl restart pr-review` |
 | System packages | Monthly | `apt update && apt upgrade` |
