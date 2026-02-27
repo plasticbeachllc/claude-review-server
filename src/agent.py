@@ -33,7 +33,10 @@ logging.root.setLevel(logging.INFO)
 log = logging.getLogger("pr-review")
 
 # ── Configuration ────────────────────────────────────────
-WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]  # tests must set before import
+try:
+    WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
+except KeyError:
+    sys.exit("GITHUB_WEBHOOK_SECRET not set — add it to /opt/pr-review/.env")
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 REVIEW_MARKER = "<!-- claude-review -->"
@@ -280,7 +283,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self.send_response(400)
+            self.end_headers()
+            return
         if length > 5_000_000:  # 5 MB sanity limit
             log.warning(f"Payload too large ({length} bytes) from {self.client_address[0]}")
             self.send_response(413)
@@ -297,6 +305,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
 
@@ -325,6 +334,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"status":"healthy"}')
         else:

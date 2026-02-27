@@ -78,7 +78,7 @@ def main():
         # application on PORT=8080); see infra/cloud-init.tmpl.yaml.
         health = ssh(ip, "curl -sf localhost:8081/health 2>/dev/null || echo 'unreachable'", timeout=10)
         print(f"Health:   {health}")
-        if health != "ok":
+        if "healthy" not in health:
             healthy = False
     except Exception:
         print("Health:   (check failed)")
