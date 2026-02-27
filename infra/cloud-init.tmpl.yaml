@@ -2,21 +2,23 @@
 # ─────────────────────────────────────────────────────────────────
 # PR Review Agent — Hetzner cloud-init
 #
-# GENERATED FILE — do not edit directly.
-# Edit the source files and run: just build
+# Source template — edit this file, then run: just build
+# The generated output (cloud-init.yaml) is gitignored.
 #
 # POST-PROVISION STEPS (do these manually after first boot):
 #   1. Set up a Cloudflare Tunnel pointing to http://localhost:80
 #      (see README for details)
 #
-#   2. Authenticate the review user:
-#        sudo -u review gh auth login          # GitHub OAuth
-#        sudo -u review claude                  # Claude subscription login
+#   2. Copy GitHub App credentials to the server:
+#        scp github-app.pem root@<ip>:/opt/pr-review/github-app.pem
+#        # Then add to /opt/pr-review/.env:
+#        #   GH_APP_ID=<from .env>
+#        #   GH_INSTALLATION_ID=<from .env>
+#        #   GH_APP_PRIVATE_KEY_FILE=/opt/pr-review/github-app.pem
+#        #   GITHUB_WEBHOOK_SECRET=<from .env>
 #
-#   3. Configure an org-level webhook in GitHub:
-#        URL:    https://<tunnel-hostname>/webhook
-#        Secret: (value from /opt/pr-review/.env)
-#        Events: Pull requests
+#   3. Authenticate Claude Code:
+#        sudo -u review claude
 #
 #   4. Start the service:
 #        sudo systemctl start pr-review
@@ -36,17 +38,10 @@ packages:
   - curl
 
 write_files:
-  # ── Main agent ────────────────────────────────────────────────
-  - path: /opt/pr-review/agent.py
-    permissions: "0755"
-    content: |
-      {{FILE:src/agent.py}}
-
-  # ── Review prompt template ──────────────────────────────────
-  - path: /opt/pr-review/prompt.md
-    permissions: "0644"
-    content: |
-      {{FILE:src/prompt.md}}
+  # ── Agent code (agent.py, prompt.md) is NOT embedded here ──
+  # These files are copied via SCP during provisioning (step 6 of
+  # `just provision`) because embedding them pushes cloud-init
+  # past Hetzner's 32 KB user_data limit.
 
   # ── Systemd service ───────────────────────────────────────
   - path: /etc/systemd/system/pr-review.service
@@ -70,15 +65,17 @@ write_files:
       # Security hardening
       NoNewPrivileges=yes
       ProtectSystem=strict
-      ReadWritePaths=/opt/pr-review
+      ReadWritePaths=/opt/pr-review /home/review
       PrivateTmp=yes
-      ProtectHome=no              # Claude auth tokens live in ~review/.claude/
+      # gh config + Claude auth tokens live in ~review/
+      ProtectHome=no
       ProtectKernelTunables=yes
       ProtectKernelModules=yes
       ProtectControlGroups=yes
       RestrictNamespaces=yes
       RestrictSUIDSGID=yes
-      MemoryDenyWriteExecute=no   # Python JIT requires writable+executable memory
+      # Python JIT requires writable+executable memory
+      MemoryDenyWriteExecute=no
 
       [Install]
       WantedBy=multi-user.target
@@ -87,26 +84,47 @@ write_files:
 
 runcmd:
   # ── Install Node.js (for Claude Code) ─────────────────────
-  - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  - apt-get install -y nodejs
-  - npm install -g @anthropic-ai/claude-code@2.1.53
+  # GPG key hash pinned to guard against supply-chain tampering between
+  # key download and package install.  Update the hash if NodeSource rotates
+  # their signing key (curl the URL and pipe through sha256sum).
+  - |
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource-repo.gpg.key
+    echo "b42e0321dabdc24e892115da705cf061167eac12a317f23d329862d0aa0a271d  /tmp/nodesource-repo.gpg.key" | sha256sum -c - \
+      || { echo "FATAL: NodeSource GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
+    gpg --yes --dearmor -o /usr/share/keyrings/nodesource.gpg /tmp/nodesource-repo.gpg.key
+    rm /tmp/nodesource-repo.gpg.key
+  # "nodistro" is NodeSource's intentional suite name (not a distro codename like jammy).
+  - echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+  - apt-get update && apt-get install -y nodejs
+  - npm install -g @anthropic-ai/claude-code@2
+  - echo "Installed claude-code version:" && npm list -g @anthropic-ai/claude-code --depth=0
 
   # ── Install GitHub CLI ────────────────────────────────────
-  - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
-  - chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  # GPG key hash pinned (same rationale as NodeSource and Cloudflare above).
+  - |
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /tmp/githubcli-archive-keyring.gpg
+    echo "20e0125d6f6e077a9ad46f03371bc26d90b04939fb95170f5a1905099cc6bcc0  /tmp/githubcli-archive-keyring.gpg" | sha256sum -c - \
+      || { echo "FATAL: GitHub CLI GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
+    mv /tmp/githubcli-archive-keyring.gpg /usr/share/keyrings/githubcli-archive-keyring.gpg
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
   - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
   - apt-get update && apt-get install -y gh
 
   # ── Install Caddy ─────────────────────────────────────────
-  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+  # GPG key hash pinned (same rationale as NodeSource and GitHub CLI above).
+  - |
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o /tmp/caddy-stable.gpg.key
+    echo "783dfee04b19e851a928cd87b34710213ebbe7628f98d9f34595ab83be578c00  /tmp/caddy-stable.gpg.key" | sha256sum -c - \
+      || { echo "FATAL: Caddy GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
+    gpg --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg /tmp/caddy-stable.gpg.key
+    rm /tmp/caddy-stable.gpg.key
+  - bash -o pipefail -c 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list'
   - chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   - chmod o+r /etc/apt/sources.list.d/caddy-stable.list
   - apt-get update && apt-get install -y caddy
 
   # ── Write Caddy config (after install so it doesn't get overwritten) ──
-  # Default: plain HTTP on :80 for Cloudflare Tunnel (tunnel terminates TLS).
-  # For Origin CA setup, replace this with a :443 TLS block — see README.
+  # Plain HTTP on :80 for Cloudflare Tunnel (tunnel terminates TLS).
   - |
     cat > /etc/caddy/Caddyfile <<'CADDYEOF'
     {
@@ -126,7 +144,6 @@ runcmd:
 
     # Internal health checks only — not exposed externally (UFW blocks 8081)
     :8081 {
-        respond /ping "pong" 200
         reverse_proxy /health 127.0.0.1:8080
     }
     CADDYEOF
@@ -134,11 +151,9 @@ runcmd:
   # ── Create service user ───────────────────────────────────
   - useradd -r -m -s /bin/bash review
 
-  # ── Generate secrets and write env file ───────────────────
+  # ── Write env file skeleton (secrets are injected by provision.py) ──
   - |
-    WEBHOOK_SECRET=$(openssl rand -hex 32)
     {
-      echo "GITHUB_WEBHOOK_SECRET=${WEBHOOK_SECRET}"
       echo "REVIEW_WORKDIR=/opt/pr-review/workspace"
       echo "MAX_WORKERS=4"
       echo "PORT=8080"
@@ -149,17 +164,33 @@ runcmd:
   - chown -R review:review /opt/pr-review
   - chmod 600 /opt/pr-review/.env
 
+  # ── Install cloudflared (via official apt repo — installs latest) ──
+  # Pre-installed for both automated (`just provision`) and manual tunnel setup.
+  # To activate: cloudflared service install <TUNNEL_TOKEN>
+  # Note: not version-pinned; pin with `cloudflared=<version>` if needed.
+  # GPG key hash pinned to guard against supply-chain tampering between
+  # key download and package install.  Update the hash if Cloudflare rotates
+  # their signing key (curl the URL and pipe through sha256sum).
+  - |
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /tmp/cloudflare-main.gpg
+    echo "1bd95f4082b320d541bee351560fc2765aa9f9cd8efa4c9e32135e63f252721d  /tmp/cloudflare-main.gpg" | sha256sum -c - \
+      || { echo "FATAL: cloudflared GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
+    mv /tmp/cloudflare-main.gpg /usr/share/keyrings/cloudflare-main.gpg
+  - echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
+  - apt-get update && apt-get install -y cloudflared
+
   # ── Firewall — only SSH ──────────────────────────────────
   # Port 80 is intentionally NOT opened: Caddy listens on :80 for the tunnel,
   # but cloudflared connects to it via localhost. No inbound ports needed.
-  # For Origin CA setups, `just setup-tls` opens 443 automatically.
   - ufw allow OpenSSH
   - ufw --force enable
 
   # ── Enable services (don't start pr-review yet — needs auth) ──
+  # pr-review is NOT enabled here: provision.py enables it after injecting
+  # credentials, so a premature reboot won't cause crash-loop restarts.
   - systemctl daemon-reload
   - systemctl enable caddy
-  - systemctl enable pr-review
+  - systemctl restart caddy
   - |
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -167,13 +198,10 @@ runcmd:
     echo ""
     echo "  1. Set up Cloudflare Tunnel (see README)"
     echo ""
-    echo "  2. Authenticate:"
-    echo "       sudo -u review gh auth login"
-    echo "       sudo -u review claude"
+    echo "  2. Inject credentials:"
+    echo "       Copy github-app.pem and set env vars (see README)"
+    echo "       Authenticate Claude: sudo -u review claude"
     echo ""
     echo "  3. Start the agent:"
     echo "       systemctl start pr-review"
-    echo ""
-    echo "  4. Configure org webhook → https://<tunnel-hostname>/webhook"
-    echo "       Secret: grep WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2"
     echo "════════════════════════════════════════════════════════"
