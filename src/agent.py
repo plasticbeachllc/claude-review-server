@@ -35,7 +35,10 @@ logging.root.setLevel(logging.INFO)
 log = logging.getLogger("pr-review")
 
 # ── Configuration ────────────────────────────────────────
-WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]  # tests must set before import
+try:
+    WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
+except KeyError:
+    sys.exit("GITHUB_WEBHOOK_SECRET not set — add it to /opt/pr-review/.env")
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
@@ -486,13 +489,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
         except (ValueError, TypeError):
+            body = b'{"error":"invalid Content-Length"}'
             self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
         if length > 5_000_000:  # 5 MB sanity limit
             log.warning(f"Payload too large ({length} bytes) from {self.client_address[0]}")
+            body = b'{"error":"payload too large"}'
             self.send_response(413)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
 
         payload = self.rfile.read(length)
@@ -500,14 +511,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if not verify_signature(payload, signature):
             log.warning(f"Invalid signature from {self.client_address[0]}")
+            body = b'{"error":"invalid signature"}'
             self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
 
+        body = b'{"ok":true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b'{"ok":true}')
+        self.wfile.write(body)
 
         event = self.headers.get("X-GitHub-Event", "")
         if event != "pull_request":
@@ -539,10 +556,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            body = b'{"status":"healthy"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy"}')
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()

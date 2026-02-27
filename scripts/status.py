@@ -15,6 +15,7 @@ Usage:
     just status
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -76,9 +77,13 @@ def main():
     try:
         # Port 8081 is the dedicated Caddy health endpoint (separate from the
         # application on PORT=8080); see infra/cloud-init.tmpl.yaml.
-        health = ssh(ip, "curl -sf localhost:8081/health 2>/dev/null || echo 'unreachable'", timeout=10)
-        print(f"Health:   {health}")
-        if "healthy" not in health:
+        health = ssh(ip, "curl -sf localhost:8081/health 2>/dev/null || echo '{\"status\":\"unreachable\"}'", timeout=10)
+        try:
+            health_ok = json.loads(health).get("status") == "healthy"
+        except (json.JSONDecodeError, AttributeError):
+            health_ok = False
+        print(f"Health:   {'healthy' if health_ok else f'(unhealthy: {health.strip()})'}")
+        if not health_ok:
             healthy = False
     except Exception:
         print("Health:   (check failed)")
