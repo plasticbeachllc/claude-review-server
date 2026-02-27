@@ -107,8 +107,7 @@ runcmd:
   - apt-get update && apt-get install -y caddy
 
   # ── Write Caddy config (after install so it doesn't get overwritten) ──
-  # Default: plain HTTP on :80 for Cloudflare Tunnel (tunnel terminates TLS).
-  # For Origin CA setup, replace this with a :443 TLS block — see README.
+  # Plain HTTP on :80 for Cloudflare Tunnel (tunnel terminates TLS).
   - |
     cat > /etc/caddy/Caddyfile <<'CADDYEOF'
     {
@@ -166,7 +165,6 @@ runcmd:
   # ── Firewall — only SSH ──────────────────────────────────
   # Port 80 is intentionally NOT opened: Caddy listens on :80 for the tunnel,
   # but cloudflared connects to it via localhost. No inbound ports needed.
-  # For Origin CA setups, `just setup-tls` opens 443 automatically.
   - ufw allow OpenSSH
   - ufw --force enable
 

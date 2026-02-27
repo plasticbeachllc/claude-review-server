@@ -40,6 +40,7 @@ You also need accounts with:
 
 - [**Hetzner Cloud**](https://console.hetzner.cloud/) (server hosting, ~$4/mo)
 - [**Cloudflare**](https://dash.cloudflare.com/) (tunnel + DNS, free tier works)
+- A **domain name** managed by Cloudflare DNS — cheap TLDs like `.xyz` or `.click` work fine (~$2/year via [Cloudflare Registrar](https://www.cloudflare.com/products/registrar/))
 - [**GitHub**](https://github.com/) org with admin access (to create and install a GitHub App)
 - A **Claude Code subscription** (Pro or Max)
 
@@ -384,7 +385,6 @@ scripts/
   _common.py             # Shared utilities
 infra/
   cloud-init.tmpl.yaml   # Server provisioning template
-  Caddyfile.origin-ca    # TLS config for custom domain setup
 tests/
   test_agent.py          # Unit tests
   test_provision.py      # Provisioning tests
@@ -406,7 +406,6 @@ Justfile                 # All commands: build, test, deploy, provision, destroy
 | `just deploy root@host` | Push code changes to a running server |
 | `just build` | Assemble cloud-init.yaml from template |
 | `just test` | Run unit tests |
-| `just setup-tls host cert key` | Configure Origin CA TLS |
 | `just destroy yes` | Tear down server + tunnel + DNS (App preserved) |
 | `just clean` | Remove built cloud-init.yaml |
 
@@ -494,23 +493,6 @@ If you didn't use `just create-app`, create the app manually:
 ### 6. Test it
 
 Open a PR. You should see a review comment within 1–2 minutes.
-
-</details>
-
-<details>
-<summary>Custom domain with Origin CA (instead of Tunnel)</summary>
-
-If you prefer a direct connection with Cloudflare Origin CA certificates:
-
-1. Cloudflare → your domain → **SSL/TLS → Origin Server → Create Certificate**
-2. Set hostname to your subdomain, copy the cert and key
-3. Set SSL mode to **Full (Strict)**
-4. Add a proxied A record pointing to your server IP
-5. Deploy the certs:
-
-```bash
-just setup-tls root@<server-ip> origin.pem origin-key.pem
-```
 
 </details>
 
