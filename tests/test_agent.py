@@ -6,9 +6,10 @@ import json
 import os
 import subprocess
 import textwrap
+import threading
 from http.server import HTTPServer
 from threading import Thread
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,8 +17,16 @@ import pytest
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret-key")
 
 from agent import (
+    DEBOUNCE_SECONDS,
     REVIEW_MARKER,
     WebhookHandler,
+    _bump_generation,
+    _is_current,
+    _PRReviewState,
+    _review_state,
+    _review_state_lock,
+    _schedule_review,
+    _shutting_down,
     already_reviewed,
     collapse_old_reviews,
     extract_diff_filenames,
@@ -827,57 +836,68 @@ def _find_call_with_arg(mock_run, arg):
 class TestReviewPr:
     """Tests for the main review_pr orchestration function."""
 
+    def _call_review(self, repo, pr_number, title, action):
+        """Helper to call review_pr with proper generation tracking."""
+        pr_key = f"{repo}#{pr_number}"
+        gen = _bump_generation(pr_key)
+        review_pr(repo, pr_number, title, action, pr_key, gen)
+
+    def _mock_claude(self, stdout="LGTM", returncode=0):
+        proc = MagicMock()
+        proc.communicate.return_value = (stdout, "")
+        proc.returncode = returncode
+        return proc
+
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="Review {repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_happy_path_opened(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="Review {repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_happy_path_opened(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             # already_reviewed: gh pr view --json comments
             _subprocess_result(stdout="0\n"),
             # gh pr diff
             _subprocess_result(stdout="diff --git a/f.py b/f.py\n+hello\n"),
-            # gh pr view --json body
-            _subprocess_result(stdout="Fix the bug\n"),
-            # claude -p
-            _subprocess_result(stdout="LGTM, no issues found."),
+            # gh pr view --json body,headRefOid
+            _subprocess_result(stdout='{"body":"Fix the bug","headRefOid":"a"}\n'),
             # gh pr comment
             _subprocess_result(stdout="https://github.com/owner/repo/pull/1#comment"),
         ]
+        mock_popen.return_value = self._mock_claude("LGTM, no issues found.")
 
-        review_pr("owner/repo", 1, "Fix bug", "opened")
+        self._call_review("owner/repo", 1, "Fix bug", "opened")
 
-        # Should have called: already_reviewed, diff, body, claude, comment
-        assert mock_run.call_count == 5
         # Verify claude was called with the prompt
-        claude_call = _find_call_with_arg(mock_run,"claude")
-        assert claude_call is not None
+        mock_popen.assert_called_once()
+        # Verify comment was posted
+        assert mock_run.call_count == 4
 
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
     def test_skips_already_reviewed_on_opened(self, mock_template, mock_run):
         mock_run.return_value = _subprocess_result(stdout="1\n")
 
-        review_pr("owner/repo", 1, "Fix bug", "opened")
+        self._call_review("owner/repo", 1, "Fix bug", "opened")
 
         # Only already_reviewed call, nothing else
         assert mock_run.call_count == 1
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_synchronize_collapses_old_reviews(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_synchronize_collapses_old_reviews(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             # collapse_old_reviews: gh api list comments (no uncollapsed)
             _subprocess_result(stdout=""),
             # gh pr diff
             _subprocess_result(stdout="diff --git a/f.py b/f.py\n+change\n"),
-            # gh pr view --json body
-            _subprocess_result(stdout="Updated\n"),
-            # claude -p
-            _subprocess_result(stdout="Looks good."),
+            # gh pr view --json body,headRefOid
+            _subprocess_result(stdout='{"body":"Updated"}\n'),
             # gh pr comment
             _subprocess_result(),
         ]
+        mock_popen.return_value = self._mock_claude("Looks good.")
 
-        review_pr("owner/repo", 2, "Update feature", "synchronize")
+        self._call_review("owner/repo", 2, "Update feature", "synchronize")
 
         # First call should be the collapse_old_reviews (gh api), not already_reviewed
         assert _find_call_with_arg(mock_run,"api") is not None
@@ -897,73 +917,74 @@ class TestReviewPr:
             _subprocess_result(returncode=1, stderr="not found"),
         ]
 
-        review_pr("owner/repo", 1, "Fix", "opened")
+        self._call_review("owner/repo", 1, "Fix", "opened")
 
         # Should stop after diff failure — no claude or comment calls
         assert mock_run.call_count == 2
 
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
     def test_returns_on_empty_diff(self, mock_template, mock_run):
-        # Note: review_pr fetches the PR body before checking diff emptiness.
-        # This mirrors the production ordering (diff → body → empty check).
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),     # already_reviewed
             _subprocess_result(stdout="   \n"),   # gh pr diff — whitespace only
-            _subprocess_result(stdout="desc\n"),  # gh pr view --json body
+            _subprocess_result(stdout='{"body":"desc"}\n'),  # gh pr view --json body,headRefOid
         ]
 
-        review_pr("owner/repo", 1, "Empty PR", "opened")
+        self._call_review("owner/repo", 1, "Empty PR", "opened")
 
         # Should stop after detecting empty diff — no claude or comment calls
         assert mock_run.call_count == 3
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_returns_on_claude_failure(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_returns_on_claude_failure(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),                           # already_reviewed
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),   # diff
-            _subprocess_result(stdout="body\n"),                       # pr body
-            _subprocess_result(returncode=1, stderr="claude error"),   # claude fails
+            _subprocess_result(stdout='{"body":"body"}\n'),            # pr info
         ]
+        mock_popen.return_value = self._mock_claude("", returncode=1)
 
-        review_pr("owner/repo", 1, "Fix", "opened")
+        self._call_review("owner/repo", 1, "Fix", "opened")
 
         # Should not attempt to post comment
-        assert mock_run.call_count == 4
+        assert mock_run.call_count == 3
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_returns_on_empty_claude_output(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_returns_on_empty_claude_output(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),                           # already_reviewed
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),   # diff
-            _subprocess_result(stdout="body\n"),                       # pr body
-            _subprocess_result(stdout="   \n"),                        # claude empty
+            _subprocess_result(stdout='{"body":"body"}\n'),            # pr info
         ]
+        mock_popen.return_value = self._mock_claude("   \n")
 
-        review_pr("owner/repo", 1, "Fix", "opened")
+        self._call_review("owner/repo", 1, "Fix", "opened")
 
-        assert mock_run.call_count == 4
+        assert mock_run.call_count == 3
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_handles_comment_post_failure(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_handles_comment_post_failure(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),                           # already_reviewed
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),   # diff
-            _subprocess_result(stdout="body\n"),                       # pr body
-            _subprocess_result(stdout="Review text"),                  # claude
+            _subprocess_result(stdout='{"body":"body"}\n'),            # pr info
             _subprocess_result(returncode=1, stderr="post failed"),    # comment fails
         ]
+        mock_popen.return_value = self._mock_claude("Review text")
 
         # Should not raise
-        review_pr("owner/repo", 1, "Fix", "opened")
-        assert mock_run.call_count == 5
+        self._call_review("owner/repo", 1, "Fix", "opened")
+        assert mock_run.call_count == 4
 
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
     def test_handles_timeout(self, mock_template, mock_run):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),  # already_reviewed
@@ -971,38 +992,40 @@ class TestReviewPr:
         ]
 
         # Should not raise — timeout is caught after already_reviewed + diff fetch
-        review_pr("owner/repo", 1, "Fix", "opened")
+        self._call_review("owner/repo", 1, "Fix", "opened")
         assert mock_run.call_count == 2
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_escapes_braces_in_title_and_body(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_escapes_braces_in_title_and_body(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),
-            _subprocess_result(stdout="body with {braces}\n"),
-            _subprocess_result(stdout="Review output"),
-            _subprocess_result(),
+            _subprocess_result(stdout='{"body":"body with {braces}"}\n'),
+            _subprocess_result(),  # comment
         ]
+        mock_popen.return_value = self._mock_claude("Review output")
 
         # Title with braces should not cause a KeyError in .format()
-        review_pr("owner/repo", 1, "Fix {something}", "opened")
+        self._call_review("owner/repo", 1, "Fix {something}", "opened")
 
         # Verify claude was called (format didn't crash)
-        assert _find_call_with_arg(mock_run,"claude") is not None
+        mock_popen.assert_called_once()
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_opened_header(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_opened_header(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),
-            _subprocess_result(stdout="body\n"),
-            _subprocess_result(stdout="Review"),
-            _subprocess_result(),
+            _subprocess_result(stdout='{"body":"body"}\n'),
+            _subprocess_result(),  # comment
         ]
+        mock_popen.return_value = self._mock_claude("Review")
 
-        review_pr("owner/repo", 1, "Fix", "opened")
+        self._call_review("owner/repo", 1, "Fix", "opened")
 
         comment_call = _find_call_with_arg(mock_run, "--body")
         assert comment_call is not None
@@ -1011,21 +1034,22 @@ class TestReviewPr:
         assert "Review" in comment_args[body_idx]  # "📝 Review" header
         assert "Updated" not in comment_args[body_idx]
 
+    @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{diff}")
-    def test_pr_body_fallback_when_fetch_fails(self, mock_template, mock_run):
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_pr_body_fallback_when_fetch_fails(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),                           # already_reviewed
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),   # diff
             _subprocess_result(returncode=1, stderr="err"),            # body fetch fails
-            _subprocess_result(stdout="Review"),                       # claude
             _subprocess_result(),                                      # comment
         ]
+        mock_popen.return_value = self._mock_claude("Review")
 
-        review_pr("owner/repo", 1, "Fix", "opened")
+        self._call_review("owner/repo", 1, "Fix", "opened")
 
         # Claude should still be called — body defaults to ""
-        assert mock_run.call_count == 5
+        mock_popen.assert_called_once()
 
 
 # ── WebhookHandler ──────────────────────────────────────
@@ -1129,8 +1153,8 @@ class TestWebhookHandlerPost:
         assert status == 200
         assert json.loads(body)["ok"] is True
 
-    @patch("agent.executor")
-    def test_pr_opened_submits_review(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_pr_opened_submits_review(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="opened", number=42, title="My PR")
         sig = _sign_payload(payload)
         headers = {
@@ -1141,20 +1165,18 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        # executor.submit() is called synchronously inside do_POST before
-        # the response is sent, so the mock is already populated here.
-        # If do_POST is ever refactored to dispatch asynchronously *after*
-        # the response, this assertion would need a sync mechanism.
-        mock_executor.submit.assert_called_once()
-        call_args = mock_executor.submit.call_args
-        assert call_args[0][0] == review_pr
-        assert call_args[0][1] == "owner/repo"
-        assert call_args[0][2] == 42
-        assert call_args[0][3] == "My PR"
-        assert call_args[0][4] == "opened"
+        mock_schedule.assert_called_once()
+        args = mock_schedule.call_args[0]
+        assert args[0] == "owner/repo#42"  # pr_key
+        assert args[1] == 0                # delay=0 for opened (no debounce)
+        assert args[2] == "owner/repo"     # repo
+        assert args[3] == 42              # pr_number
+        assert args[4] == "My PR"         # title
+        assert args[5] == "opened"        # action
+        assert isinstance(args[6], int)   # generation
 
-    @patch("agent._schedule_debounced_review")
-    def test_pr_synchronize_schedules_debounce(self, mock_debounce, http_server):
+    @patch("agent._schedule_review")
+    def test_pr_synchronize_submits_review(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="synchronize", number=10)
         sig = _sign_payload(payload)
         headers = {
@@ -1165,14 +1187,16 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        mock_debounce.assert_called_once()
-        call_args = mock_debounce.call_args[0]
-        assert call_args[0] == "owner/repo"
-        assert call_args[1] == 10
-        assert call_args[3] == "synchronize"
+        mock_schedule.assert_called_once()
+        call_args = mock_schedule.call_args
+        # Verify delay=DEBOUNCE_SECONDS for synchronize events
+        assert call_args[0][1] == DEBOUNCE_SECONDS
+        assert call_args[0][2] == "owner/repo"
+        assert call_args[0][3] == 10
+        assert call_args[0][5] == "synchronize"
 
-    @patch("agent.executor")
-    def test_pr_closed_does_not_submit(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_pr_closed_does_not_submit(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="closed")
         sig = _sign_payload(payload)
         headers = {
@@ -1182,10 +1206,10 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
-    @patch("agent.executor")
-    def test_draft_pr_skipped(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_draft_pr_skipped(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="opened", draft=True)
         sig = _sign_payload(payload)
         headers = {
@@ -1195,10 +1219,10 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
-    @patch("agent.executor")
-    def test_non_pr_event_ignored(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_non_pr_event_ignored(self, mock_schedule, http_server):
         payload = _make_pr_payload()
         sig = _sign_payload(payload)
         headers = {
@@ -1208,7 +1232,7 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
     def test_oversized_payload_returns_413(self, http_server):
         # Relies on do_POST checking Content-Length *before* reading the body.
@@ -1224,8 +1248,8 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 413
 
-    @patch("agent.executor")
-    def test_missing_event_header_returns_200_no_submit(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_missing_event_header_returns_200_no_submit(self, mock_schedule, http_server):
         """A valid signature but no X-GitHub-Event should return 200 but not submit."""
         payload = _make_pr_payload()
         sig = _sign_payload(payload)
@@ -1235,7 +1259,7 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
 
 # ── get_prompt_template ─────────────────────────────────
@@ -1293,3 +1317,318 @@ class TestJSONFormatter:
         parsed = json.loads(output)
         assert "exc" in parsed
         assert "ValueError" in parsed["exc"]
+
+
+# ── Generation tracking ─────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clean_review_state():
+    """Reset module-level review state between tests."""
+    yield
+    with _review_state_lock:
+        for state in _review_state.values():
+            if state.timer is not None:
+                state.timer.cancel()
+        _review_state.clear()
+    _shutting_down.clear()
+
+
+class TestBumpGeneration:
+    def test_first_bump_returns_1(self):
+        assert _bump_generation("org/repo#1") == 1
+
+    def test_successive_bumps_increment(self):
+        _bump_generation("org/repo#2")
+        assert _bump_generation("org/repo#2") == 2
+        assert _bump_generation("org/repo#2") == 3
+
+    def test_independent_prs_have_separate_generations(self):
+        assert _bump_generation("org/repo#10") == 1
+        assert _bump_generation("org/repo#20") == 1
+        assert _bump_generation("org/repo#10") == 2
+        assert _bump_generation("org/repo#20") == 2
+
+    def test_kills_active_process_on_bump(self):
+        pr_key = "org/repo#3"
+        _bump_generation(pr_key)
+
+        mock_proc = MagicMock()
+        with _review_state_lock:
+            _review_state[pr_key].process = mock_proc
+
+        _bump_generation(pr_key)
+
+        mock_proc.terminate.assert_called_once()
+        mock_proc.wait.assert_not_called()  # communicate() is the sole wait
+
+    def test_cancels_pending_timer_on_bump(self):
+        pr_key = "org/repo#4"
+        _bump_generation(pr_key)
+
+        mock_timer = MagicMock()
+        with _review_state_lock:
+            _review_state[pr_key].timer = mock_timer
+
+        _bump_generation(pr_key)
+
+        mock_timer.cancel.assert_called_once()
+
+    def test_handles_already_dead_process(self):
+        pr_key = "org/repo#5"
+        _bump_generation(pr_key)
+
+        mock_proc = MagicMock()
+        mock_proc.terminate.side_effect = OSError("No such process")
+        with _review_state_lock:
+            _review_state[pr_key].process = mock_proc
+
+        # Should not raise
+        gen = _bump_generation(pr_key)
+        assert gen == 2
+
+
+class TestIsCurrent:
+    def test_current_generation_returns_true(self):
+        gen = _bump_generation("org/repo#100")
+        assert _is_current("org/repo#100", gen) is True
+
+    def test_stale_generation_returns_false(self):
+        gen1 = _bump_generation("org/repo#101")
+        _bump_generation("org/repo#101")  # gen2
+        assert _is_current("org/repo#101", gen1) is False
+
+    def test_unknown_pr_returns_false(self):
+        assert _is_current("org/repo#999", 1) is False
+
+    def test_shutting_down_returns_false(self):
+        gen = _bump_generation("org/repo#102")
+        _shutting_down.set()
+        assert _is_current("org/repo#102", gen) is False
+
+
+class TestReviewPrCancellation:
+    """Test that review_pr bails out when superseded."""
+
+    def _mock_diff(self, returncode=0):
+        return MagicMock(
+            returncode=returncode,
+            stdout="diff --git a/f.py b/f.py\n+hello\n",
+            stderr="",
+        )
+
+    def _mock_body(self):
+        return MagicMock(returncode=0, stdout='{"body":"PR body","headRefOid":"' + "a" * 40 + '"}')
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
+    @patch("agent.subprocess.run")
+    def test_skips_diff_fetch_when_superseded(self, mock_run, _mock_tpl):
+        pr_key = "org/repo#50"
+        gen = _bump_generation(pr_key)
+        _bump_generation(pr_key)  # supersede
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        review_pr("org/repo", 50, "title", "synchronize", pr_key, gen)
+
+        # _is_current fails before any subprocess calls, so nothing should run.
+        assert mock_run.call_count == 0
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    def test_skips_claude_when_superseded_after_diff(self, mock_run, mock_popen, _mock_tpl):
+        pr_key = "org/repo#51"
+        gen = _bump_generation(pr_key)
+
+        # subprocess.run calls: collapse_old_reviews (returns nothing), diff, body
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # collapse api
+            self._mock_diff(),  # diff
+            self._mock_body(),  # body
+        ]
+
+        # Supersede after diff fetch but before Claude. We do this by making
+        # _is_current return False on the second call (before Claude).
+        call_count = 0
+
+        def fake_is_current(key, g):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return True  # pass the first check (before start)
+            return False  # fail the second check (before Claude)
+
+        with patch("agent._is_current", side_effect=fake_is_current):
+            review_pr("org/repo", 51, "title", "synchronize", pr_key, gen)
+
+        mock_popen.assert_not_called()
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    def test_skips_posting_when_superseded_after_claude(self, mock_run, mock_popen, _mock_tpl):
+        pr_key = "org/repo#52"
+        gen = _bump_generation(pr_key)
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # collapse api
+            self._mock_diff(),  # diff
+            self._mock_body(),  # body
+        ]
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("Review output", "")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        call_count = 0
+
+        def fake_is_current(key, g):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return True  # pass checks before start and before Claude
+            return False  # fail the check before posting
+
+        with patch("agent._is_current", side_effect=fake_is_current):
+            review_pr("org/repo", 52, "title", "synchronize", pr_key, gen)
+
+        # Should not have posted a comment
+        for call in mock_run.call_args_list:
+            args = call[0][0]
+            assert args[:3] != ["gh", "pr", "comment"], \
+                "Should not post comment for superseded review"
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    def test_handles_killed_claude_process(self, mock_run, mock_popen, _mock_tpl):
+        """When Claude is killed by signal, review_pr logs and exits cleanly."""
+        pr_key = "org/repo#53"
+        gen = _bump_generation(pr_key)
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="0\n"),  # already_reviewed
+            self._mock_diff(),  # diff (no collapse for "opened")
+            self._mock_body(),  # body
+        ]
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "")
+        mock_proc.returncode = -15  # killed by SIGTERM
+        mock_popen.return_value = mock_proc
+
+        # Should not raise
+        review_pr("org/repo", 53, "title", "opened", pr_key, gen)
+
+        # No comment posted
+        for call in mock_run.call_args_list:
+            args = call[0][0]
+            assert args[:3] != ["gh", "pr", "comment"]
+
+
+class TestScheduleReview:
+    """Tests for _schedule_review debounce timer."""
+
+    @patch("agent.executor")
+    def test_immediate_submit_with_zero_delay(self, mock_executor):
+        """delay=0 fires the timer immediately, submitting to executor."""
+        pr_key = "org/repo#60"
+        gen = _bump_generation(pr_key)
+
+        _schedule_review(pr_key, 0, "org/repo", 60, "title", "opened", gen)
+
+        # Timer(0, ...) fires essentially immediately; give it a moment.
+        import time
+        time.sleep(0.1)
+
+        mock_executor.submit.assert_called_once()
+        call_args = mock_executor.submit.call_args
+        assert call_args[0][0] == review_pr
+        assert call_args[0][1] == "org/repo"
+        assert call_args[0][2] == 60
+        assert call_args[0][4] == "opened"
+        assert call_args[0][5] == pr_key
+        assert call_args[0][6] == gen
+
+    @patch("agent.executor")
+    def test_timer_registered_in_state(self, mock_executor):
+        """_schedule_review stores the timer in _review_state."""
+        pr_key = "org/repo#61"
+        gen = _bump_generation(pr_key)
+
+        _schedule_review(pr_key, 9999, "org/repo", 61, "title", "synchronize", gen)
+
+        with _review_state_lock:
+            state = _review_state[pr_key]
+            assert state.timer is not None
+
+        # Clean up — cancel the long timer
+        state.timer.cancel()
+
+    @patch("agent.executor")
+    def test_bump_cancels_pending_timer(self, mock_executor):
+        """A second bump cancels the first timer before it fires."""
+        import time
+
+        pr_key = "org/repo#62"
+        gen1 = _bump_generation(pr_key)
+
+        _schedule_review(pr_key, 9999, "org/repo", 62, "title", "synchronize", gen1)
+
+        with _review_state_lock:
+            timer1 = _review_state[pr_key].timer
+
+        # Second push arrives — cancels the pending timer.
+        gen2 = _bump_generation(pr_key)
+
+        # Timer.cancel() sets the internal finished event; wait for thread exit.
+        timer1.join(timeout=1)
+        assert timer1.is_alive() is False
+
+        # Schedule a new review with 0 delay.
+        _schedule_review(pr_key, 0, "org/repo", 62, "title", "synchronize", gen2)
+
+        time.sleep(0.1)
+
+        # Only the second review should have been submitted.
+        mock_executor.submit.assert_called_once()
+        call_args = mock_executor.submit.call_args
+        assert call_args[0][6] == gen2
+
+    @patch("agent.executor")
+    def test_stale_generation_prevents_submit(self, mock_executor):
+        """_schedule_review with a stale generation does not submit."""
+        import time
+
+        pr_key = "org/repo#63"
+        gen1 = _bump_generation(pr_key)
+        # Immediately supersede so _is_current(pr_key, gen1) is False.
+        _bump_generation(pr_key)
+
+        # Schedule with the stale generation — _submit callback will check
+        # _is_current and bail out.
+        _schedule_review(pr_key, 0, "org/repo", 63, "title", "synchronize", gen1)
+
+        time.sleep(0.1)
+
+        mock_executor.submit.assert_not_called()
+
+    @patch("agent.executor")
+    def test_rapid_syncs_coalesce(self, mock_executor):
+        """Multiple rapid synchronize events should coalesce into one review."""
+        pr_key = "org/repo#64"
+
+        # Simulate 3 rapid pushes (each bump cancels the previous timer).
+        for _ in range(3):
+            gen = _bump_generation(pr_key)
+
+        # Only schedule after the last push.
+        _schedule_review(pr_key, 0, "org/repo", 64, "title", "synchronize", gen)
+
+        import time
+        time.sleep(0.1)
+
+        mock_executor.submit.assert_called_once()
+        assert mock_executor.submit.call_args[0][6] == gen  # latest generation

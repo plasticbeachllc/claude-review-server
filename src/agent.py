@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote
@@ -42,6 +43,7 @@ except KeyError:
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
+DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "10"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
@@ -70,18 +72,93 @@ LOW_PRIORITY_PATTERNS = [
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 PORT = int(os.environ.get("PORT", "8080"))
-DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "30"))
 MAX_COMMENT_CHARS = 65_000  # GitHub comment limit is 65536
+
+
+# ── Per-PR review state (generation tracking + process handle) ───
+@dataclass
+class _PRReviewState:
+    generation: int = 0
+    process: subprocess.Popen | None = None
+    timer: threading.Timer | None = None
+
+_review_state: dict[str, _PRReviewState] = {}
+_review_state_lock = threading.Lock()
+_shutting_down = threading.Event()
 
 # Regex for extracting the filename from "diff --git a/path b/path"
 DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
 
-# Debounce tracking: maps "repo#number" -> Timer.
-# When a new event arrives, the previous timer is cancelled and a new one
-# is started.  This avoids consuming executor threads with sleeping workers.
-_debounce_timers: dict[str, threading.Timer] = {}
-_debounce_lock = threading.Lock()
-_shutting_down = threading.Event()
+# ── Generation tracking ────────────────────────────────
+
+def _bump_generation(pr_key: str) -> int:
+    """Increment the generation counter for a PR.
+
+    Cancels any pending debounce timer and sends SIGTERM to any running
+    Claude process.  We intentionally do NOT call proc.wait() here —
+    the communicate() call in review_pr is the single authoritative wait.
+    """
+    with _review_state_lock:
+        state = _review_state.get(pr_key)
+        if state is None:
+            state = _PRReviewState(generation=1)
+            _review_state[pr_key] = state
+            return 1
+
+        state.generation += 1
+        gen = state.generation
+        proc = state.process
+        state.process = None
+        timer = state.timer
+        state.timer = None
+
+    # Cancel pending debounce timer.
+    if timer is not None:
+        timer.cancel()
+
+    # Signal process to exit; communicate() in review_pr handles the wait.
+    if proc is not None:
+        log.info(f"Killing superseded review for {pr_key} (gen {gen - 1})")
+        try:
+            proc.terminate()
+        except OSError:
+            pass  # already dead
+
+    return gen
+
+
+def _is_current(pr_key: str, generation: int) -> bool:
+    """Return True if *generation* is still the latest for this PR."""
+    if _shutting_down.is_set():
+        return False
+    with _review_state_lock:
+        state = _review_state.get(pr_key)
+        return state is not None and state.generation == generation
+
+
+def _schedule_review(
+    pr_key: str, delay: float,
+    repo: str, pr_number: int, title: str, action: str, generation: int,
+):
+    """Start a timer that submits review_pr after *delay* seconds.
+
+    The timer is registered in _review_state so that _bump_generation can
+    cancel it if a new push arrives before the timer fires.
+    """
+    def _submit():
+        if _is_current(pr_key, generation):
+            executor.submit(
+                review_pr, repo, pr_number, title, action,
+                pr_key, generation,
+            )
+
+    timer = threading.Timer(delay, _submit)
+    with _review_state_lock:
+        state = _review_state.get(pr_key)
+        if state is not None and state.generation == generation:
+            state.timer = timer
+    timer.start()
+
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -312,41 +389,28 @@ def collapse_old_reviews(repo: str, pr_number: int):
         )
 
 
-def _schedule_debounced_review(repo: str, pr_number: int, pr_title: str,
-                               action: str):
-    """Schedule a review after the debounce window using threading.Timer.
+def review_pr(
+    repo: str,
+    pr_number: int,
+    pr_title: str,
+    action: str,
+    pr_key: str,
+    generation: int,
+):
+    """Fetch diff, invoke Claude, post review comment.
 
-    Cancels any previously scheduled timer for the same PR so only the
-    last event in a burst actually triggers a review.  The timer fires
-    outside the executor, so sleeping doesn't consume worker slots.
+    Bails out early if a newer generation supersedes this one (i.e. a new
+    push arrived while we were working).
     """
-    key = f"{repo}#{pr_number}"
-
-    def _fire():
-        with _debounce_lock:
-            _debounce_timers.pop(key, None)
-        if _shutting_down.is_set():
-            log.info(f"Skipping debounced review for {key} (shutting down)")
-            return
-        executor.submit(review_pr, repo, pr_number, pr_title, action)
-
-    with _debounce_lock:
-        old = _debounce_timers.get(key)
-        if old is not None:
-            old.cancel()
-            log.info(f"Debounced {key} (superseded by newer event)")
-        timer = threading.Timer(DEBOUNCE_SECONDS, _fire)
-        timer.daemon = True
-        _debounce_timers[key] = timer
-        timer.start()
-
-
-def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
-    """Fetch diff, invoke Claude, post review comment."""
-    log.info(f"Reviewing {repo}#{pr_number}: {pr_title} ({action})")
+    log.info(f"Reviewing {pr_key}: {pr_title} ({action}) [gen={generation}]")
     try:
         if action == "opened" and already_reviewed(repo, pr_number):
-            log.info(f"Already reviewed {repo}#{pr_number}, skipping")
+            log.info(f"Already reviewed {pr_key}, skipping")
+            return
+
+        # ── Check before any work (avoids wasted API calls) ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before start {pr_key} gen={generation}")
             return
 
         # Collapse old reviews on force-push
@@ -380,7 +444,7 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
         diff, truncation_note = smart_truncate_diff(diff_result.stdout)
 
         if not diff.strip():
-            log.warning(f"Empty diff for {repo}#{pr_number}")
+            log.warning(f"Empty diff for {pr_key}")
             return
 
         # Fetch full contents of changed files for richer context
@@ -428,18 +492,59 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
         # Collapse runs of blank lines left by empty placeholders
         prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True, text=True, timeout=300,
-            cwd=str(WORKDIR),
-        )
-        if result.returncode != 0:
-            log.error(f"claude failed (exit {result.returncode}): {result.stderr}")
+        # ── Check before Claude invocation (the expensive step) ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before Claude call {pr_key} gen={generation}")
             return
 
-        review_text = result.stdout.strip()
+        # Use Popen so the webhook handler can kill us mid-flight.
+        proc = subprocess.Popen(
+            ["claude", "-p", prompt, "--output-format", "text"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(WORKDIR),
+        )
+
+        # Register process so _bump_generation can kill it.
+        with _review_state_lock:
+            state = _review_state.get(pr_key)
+            if state is not None and state.generation == generation:
+                state.process = proc
+            else:
+                # Already superseded between the check above and now.
+                proc.kill()
+                proc.wait()
+                return
+
+        try:
+            stdout, stderr = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            log.error(f"Claude timed out for {pr_key}")
+            return
+        finally:
+            # Unregister process handle.
+            with _review_state_lock:
+                state = _review_state.get(pr_key)
+                if state is not None and state.process is proc:
+                    state.process = None
+
+        if proc.returncode != 0:
+            # returncode < 0 means killed by signal (i.e. we cancelled it).
+            if proc.returncode < 0:
+                log.info(f"Claude killed (signal {-proc.returncode}) for {pr_key}")
+                return
+            log.error(f"claude failed (exit {proc.returncode}): {stderr}")
+            return
+
+        review_text = stdout.strip()
         if not review_text:
             log.warning("Empty review output")
+            return
+
+        # ── Final check before posting ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before posting {pr_key} gen={generation}")
             return
 
         header = "🔄 Updated Review" if action == "synchronize" else "📝 Review"
@@ -451,7 +556,7 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
         if len(review_text) > max_review:
             truncation_msg = "\n\n*(Review truncated — exceeded GitHub comment size limit)*"
             review_text = review_text[:max_review - len(truncation_msg)] + truncation_msg
-            log.warning(f"Truncated review for {repo}#{pr_number} to fit comment limit")
+            log.warning(f"Truncated review for {pr_key} to fit comment limit")
 
         comment = (
             f"{REVIEW_MARKER}\n"
@@ -469,12 +574,21 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             log.error(f"Failed to post comment: {post_result.stderr}")
             return
 
-        log.info(f"Posted review for {repo}#{pr_number}")
+        log.info(f"Posted review for {pr_key} [gen={generation}]")
 
     except subprocess.TimeoutExpired:
-        log.error(f"Timeout reviewing {repo}#{pr_number}")
+        log.error(f"Timeout reviewing {pr_key}")
     except Exception as e:
-        log.error(f"Error reviewing {repo}#{pr_number}: {e}", exc_info=True)
+        log.error(f"Error reviewing {pr_key}: {e}", exc_info=True)
+    finally:
+        # Prune state entry to prevent unbounded memory growth.
+        with _review_state_lock:
+            state = _review_state.get(pr_key)
+            if (state is not None
+                    and state.generation == generation
+                    and state.process is None
+                    and state.timer is None):
+                del _review_state[pr_key]
 
 
 # ── HTTP handler ────────────────────────────────────────
@@ -542,15 +656,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 return
 
             repo = data["repository"]["full_name"]
-            number = pr["number"]
-            title = pr["title"]
+            pr_number = pr["number"]
+            pr_key = f"{repo}#{pr_number}"
+            generation = _bump_generation(pr_key)
 
-            # Debounce rapid force-pushes: delay "synchronize" events so
-            # only the last push in a burst actually triggers a review.
-            if action == "synchronize" and DEBOUNCE_SECONDS > 0:
-                _schedule_debounced_review(repo, number, title, action)
-            else:
-                executor.submit(review_pr, repo, number, title, action)
+            delay = 0 if action == "opened" else DEBOUNCE_SECONDS
+            _schedule_review(
+                pr_key, delay,
+                repo, pr_number, pr["title"], action, generation,
+            )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             log.error(f"Malformed webhook payload: {e}")
 
@@ -570,24 +684,38 @@ class WebhookHandler(BaseHTTPRequestHandler):
         log.info(f"{self.client_address[0]} {fmt % args}")
 
 
+_shutdown_thread: threading.Thread | None = None  # set by _shutdown()
+
 if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
     server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
 
     def _do_shutdown():
         """Perform blocking shutdown work off the signal handler thread."""
+        if _shutting_down.is_set():
+            return  # guard against double-signal
         _shutting_down.set()
-        # Cancel any pending debounce timers
-        with _debounce_lock:
-            for timer in _debounce_timers.values():
-                timer.cancel()
-            _debounce_timers.clear()
+        # Collect processes and timers under the lock, act outside it.
+        with _review_state_lock:
+            timers = [s.timer for s in _review_state.values()
+                      if s.timer is not None]
+            procs = [s.process for s in _review_state.values()
+                     if s.process is not None]
+        for timer in timers:
+            timer.cancel()
+        for proc in procs:
+            try:
+                proc.terminate()  # graceful SIGTERM; communicate() handles wait
+            except OSError:
+                pass
         server.shutdown()
         executor.shutdown(wait=True, cancel_futures=False)
 
     def _shutdown(signum, _frame):
+        global _shutdown_thread
         log.info(f"Received {signal.Signals(signum).name}, shutting down...")
-        threading.Thread(target=_do_shutdown, daemon=True).start()
+        _shutdown_thread = threading.Thread(target=_do_shutdown)
+        _shutdown_thread.start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -595,3 +723,7 @@ if __name__ == "__main__":
     log.info(f"PR Review Agent listening on 127.0.0.1:{PORT} "
              f"(workers={MAX_WORKERS})")
     server.serve_forever()
+
+    # Join the shutdown thread so in-flight reviews finish before exit.
+    if _shutdown_thread is not None:
+        _shutdown_thread.join()
