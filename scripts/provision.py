@@ -551,38 +551,6 @@ def setup_tunnel(config: dict, server_ip: str, created: dict | None = None) -> s
     return hostname
 
 
-def wait_for_tunnel(hostname: str, timeout: int = 120):
-    """Poll the tunnel's public URL until it responds with HTTP 200.
-
-    A freshly installed ``cloudflared`` needs time to establish its edge
-    connections.  Starting the application service before the tunnel is
-    reachable causes GitHub webhook deliveries to fail silently.
-    """
-    deadline = time.time() + timeout
-    print(f"  Waiting for https://{hostname}/health ...", end="", flush=True)
-    while time.time() < deadline:
-        try:
-            resp = requests.get(
-                f"https://{hostname}/health", timeout=5, allow_redirects=False,
-            )
-            if resp.status_code == 502:
-                # Cloudflare returns 502 when cloudflared is connected but
-                # the upstream (pr-review) isn't running yet — that's fine,
-                # it means the tunnel itself is working.
-                print(" ok (tunnel up, service not yet started)")
-                return
-            if resp.status_code == 200:
-                print(" ok")
-                return
-        except requests.RequestException:
-            pass
-        print(".", end="", flush=True)
-        time.sleep(5)
-    raise ProvisionError(
-        f"Tunnel not reachable at https://{hostname}/health after {timeout}s. "
-        f"Check cloudflared logs: ssh root@<ip> journalctl -u cloudflared -n 50"
-    )
-
 
 def _auto_cleanup(created: dict, config: dict):
     """Best-effort cleanup of partially created resources on failure."""
@@ -628,15 +596,15 @@ def main():
 
     try:
         # 1. Config
-        print("[1/10] Loading configuration...")
+        print("[1/9] Loading configuration...")
         config = load_config(root)
 
         # 2. Build cloud-init
-        print("[2/10] Building cloud-init.yaml...")
+        print("[2/9] Building cloud-init.yaml...")
         cloud_init = build(root)
 
         # 3. SSH key
-        print("[3/10] Setting up SSH key...")
+        print("[3/9] Setting up SSH key...")
         pubkey = find_local_pubkey(config)
         client = Client(token=config["HCLOUD_TOKEN"])
         ssh_key, key_created = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
@@ -644,38 +612,33 @@ def main():
             created["ssh_key"] = ssh_key.name
 
         # 4. Create server
-        print("[4/10] Creating Hetzner server...")
+        print("[4/9] Creating Hetzner server...")
         server = create_server(client, config, ssh_key, cloud_init)
         ip = server.public_net.ipv4.ip
         created["server"] = config["SERVER_NAME"]
         print(f"  Server IP: {ip}")
 
         # 5. Wait for boot
-        print("[5/10] Waiting for server to be ready...")
+        print("[5/9] Waiting for server to be ready...")
         wait_for_ssh(ip)
         wait_for_cloud_init(ip)
 
         # 6. Deploy agent files (not embedded in cloud-init due to 32KB limit)
-        print("[6/10] Deploying agent code...")
+        print("[6/9] Deploying agent code...")
         deploy_agent_files(ip, root)
 
         # 7. Inject auth
-        print("[7/10] Injecting auth tokens...")
+        print("[7/9] Injecting auth tokens...")
         inject_auth(ip, config)
 
         # 8. Cloudflare Tunnel (setup_tunnel updates `created` progressively)
-        print("[8/10] Setting up Cloudflare Tunnel...")
+        print("[8/9] Setting up Cloudflare Tunnel...")
         hostname = setup_tunnel(config, ip, created=created)
 
-        # 9. Wait for tunnel to stabilize (cloudflared needs time to
-        # establish edge connections after a fresh install)
-        print("[9/10] Waiting for tunnel readiness...")
-        wait_for_tunnel(hostname)
-
-        # 10. Enable + start service (webhook is configured by `just create-app`)
+        # 9. Enable + start service (webhook is configured by `just create-app`)
         # Enable here (not in cloud-init) so a premature reboot before auth
         # injection won't cause crash-loop restarts.
-        print("[10/10] Starting service...")
+        print("[9/9] Starting service...")
         ssh(ip, "systemctl enable --now pr-review")
 
         # Verify the service actually started (retry to allow systemd to settle)
