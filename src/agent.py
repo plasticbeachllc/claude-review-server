@@ -15,8 +15,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote
@@ -150,18 +151,19 @@ def _get_installation_token() -> str:
                 f"GitHub token exchange failed ({e.code}): {body}"
             ) from e
 
-        _token_cache.token = data["token"]
-        # Use the actual expiry from GitHub's response, with a 5-minute buffer.
-        expires_str = data.get("expires_at", "")
-        if expires_str:
-            from datetime import datetime, timezone
-            expires_at = datetime.fromisoformat(
-                expires_str.replace("Z", "+00:00")
-            )
-            _token_cache.expires_at = expires_at.timestamp()
-        else:
-            # Fallback: conservative 58-minute cache (tokens last 60 minutes).
-            _token_cache.expires_at = time.time() + 3480
+        try:
+            _token_cache.token = data["token"]
+            expires_str = data["expires_at"]
+        except KeyError as e:
+            raise RuntimeError(
+                f"Unexpected token response (missing {e}): {data}"
+            ) from e
+
+        # Use the actual expiry from GitHub's response.
+        expires_at = datetime.fromisoformat(
+            expires_str.replace("Z", "+00:00")
+        )
+        _token_cache.expires_at = expires_at.timestamp()
         log.info("Refreshed GitHub App installation token")
         return _token_cache.token
 

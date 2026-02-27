@@ -127,7 +127,10 @@ class TestInstallationToken:
             _token_cache.expires_at = _time.time() + 60  # only 1 min left (< 5 min buffer)
 
         mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({"token": "new_token"}).encode()
+        mock_resp.read.return_value = json.dumps({
+            "token": "new_token",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }).encode()
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
 

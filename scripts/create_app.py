@@ -19,6 +19,7 @@ Usage:
     just create-app
 """
 
+import html
 import json
 import socket
 import sys
@@ -128,7 +129,7 @@ class _ManifestHandler(BaseHTTPRequestHandler):
                click the button below.</p>
             <form id="manifest-form" method="post"
                   action="https://github.com/organizations/{org}/settings/apps/new">
-              <input type="hidden" name="manifest" value='{manifest}'>
+              <input type="hidden" name="manifest" value="{html.escape(manifest)}">
               <button type="submit">Create GitHub App</button>
             </form>
             <script>document.getElementById('manifest-form').submit();</script>
@@ -177,7 +178,7 @@ def create_app(root: Path) -> dict:
     # Check if app already exists
     if config.get("GH_APP_ID"):
         print(
-            f"WARNING: GH_APP_ID={config['GH_APP_ID']} already set in .env.\n"
+            f"ERROR: GH_APP_ID={config['GH_APP_ID']} already set in .env.\n"
             f"If you want to create a new app, remove GH_APP_ID from .env first.",
             file=sys.stderr,
         )
