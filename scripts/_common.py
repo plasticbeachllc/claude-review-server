@@ -11,7 +11,6 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 CF_API = "https://api.cloudflare.com/client/v4"
-GH_API = "https://api.github.com"
 
 REQUIRED_KEYS = [
     "HCLOUD_TOKEN",
@@ -190,42 +189,6 @@ def wait_for_cloud_init(ip: str, timeout: int = 600):
         print(".", end="", flush=True)
         time.sleep(10)
     raise ProvisionError(f"cloud-init did not finish within {timeout}s")
-
-
-# ---------------------------------------------------------------------------
-# GitHub API helpers
-# ---------------------------------------------------------------------------
-def gh_paginate(url: str, headers: dict, params: dict | None = None,
-                timeout: int = 30) -> list:
-    """Fetch all pages of a GitHub API list endpoint.
-
-    Follows ``Link: rel="next"`` headers automatically so callers never
-    silently miss results.  ``params`` are only sent on the first request;
-    subsequent pages use the URL from the Link header which already contains
-    query parameters.
-    """
-    all_items: list = []
-    while url:
-        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-        if resp.status_code != 200:
-            raise ProvisionError(
-                f"GitHub API error ({resp.status_code}): {resp.text}"
-            )
-        page_data = resp.json()
-        if not isinstance(page_data, list):
-            raise ProvisionError(
-                f"GitHub API returned unexpected response shape: {repr(page_data)[:200]}"
-            )
-        all_items.extend(page_data)
-        # Follow pagination — params are baked into the Link URL for page 2+
-        url = None
-        params = None
-        link = resp.headers.get("Link", "")
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                url = part.split(";")[0].strip().strip("<>")
-                break
-    return all_items
 
 
 # ---------------------------------------------------------------------------

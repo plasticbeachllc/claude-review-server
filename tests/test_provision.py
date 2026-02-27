@@ -7,16 +7,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-def _gh_response(status_code=200, json_data=None, text="", headers=None):
-    """Create a mock GitHub API response with sensible defaults."""
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.json = MagicMock(return_value=json_data if json_data is not None else [])
-    resp.text = text
-    resp.headers = headers or {}
-    return resp
-
-
 # ── Config loading ─────────────────────────────────────────
 
 
@@ -246,95 +236,6 @@ class TestCfRequest:
         result = cf_request("DELETE", "/test/path", "my-token")
 
         assert result == {"success": True, "result": None}
-
-
-# ── GitHub pagination ──────────────────────────────────────
-
-
-@pytest.mark.usefixtures("scripts_on_path")
-class TestGhPaginate:
-    @patch("_common.requests.get")
-    def test_single_page(self, mock_get):
-        from _common import gh_paginate
-
-        mock_get.return_value = _gh_response(200, [{"id": 1}, {"id": 2}])
-
-        items = gh_paginate(
-            "https://api.github.com/orgs/x/hooks",
-            headers={"Authorization": "Bearer tok"},
-            params={"per_page": 100},
-        )
-        assert items == [{"id": 1}, {"id": 2}]
-        mock_get.assert_called_once()
-
-    @patch("_common.requests.get")
-    def test_follows_next_link(self, mock_get):
-        from _common import gh_paginate
-
-        page1 = _gh_response(200, [{"id": 1}], headers={
-            "Link": '<https://api.github.com/orgs/x/hooks?page=2>; rel="next"',
-        })
-        page2 = _gh_response(200, [{"id": 2}])
-        mock_get.side_effect = [page1, page2]
-
-        items = gh_paginate(
-            "https://api.github.com/orgs/x/hooks",
-            headers={"Authorization": "Bearer tok"},
-            params={"per_page": 100},
-        )
-        assert items == [{"id": 1}, {"id": 2}]
-        assert mock_get.call_count == 2
-        # Second call should use the URL from the Link header, no params
-        second_call = mock_get.call_args_list[1]
-        assert second_call[0][0] == "https://api.github.com/orgs/x/hooks?page=2"
-        assert second_call[1]["params"] is None
-
-    @patch("_common.requests.get")
-    def test_raises_on_error(self, mock_get):
-        from _common import ProvisionError, gh_paginate
-
-        mock_get.return_value = _gh_response(403, text="Forbidden")
-
-        with pytest.raises(ProvisionError, match="403"):
-            gh_paginate(
-                "https://api.github.com/orgs/x/hooks",
-                headers={"Authorization": "Bearer tok"},
-            )
-
-    @patch("_common.requests.get")
-    def test_follows_multiple_pages(self, mock_get):
-        from _common import gh_paginate
-
-        page1 = _gh_response(200, [{"id": 1}], headers={
-            "Link": '<https://api.github.com/orgs/x/hooks?page=2>; rel="next", '
-                    '<https://api.github.com/orgs/x/hooks?page=3>; rel="last"',
-        })
-        page2 = _gh_response(200, [{"id": 2}], headers={
-            "Link": '<https://api.github.com/orgs/x/hooks?page=3>; rel="next"',
-        })
-        page3 = _gh_response(200, [{"id": 3}])
-        mock_get.side_effect = [page1, page2, page3]
-
-        items = gh_paginate(
-            "https://api.github.com/orgs/x/hooks",
-            headers={"Authorization": "Bearer tok"},
-            params={"per_page": 100},
-        )
-        assert items == [{"id": 1}, {"id": 2}, {"id": 3}]
-        assert mock_get.call_count == 3
-
-    @patch("_common.requests.get")
-    def test_raises_on_non_list_response(self, mock_get):
-        from _common import ProvisionError, gh_paginate
-
-        # GitHub might return a dict (e.g. rate-limit info) instead of a list
-        mock_get.return_value = _gh_response(200, {"message": "rate limit exceeded"})
-
-        with pytest.raises(ProvisionError, match="unexpected response shape"):
-            gh_paginate(
-                "https://api.github.com/orgs/x/hooks",
-                headers={"Authorization": "Bearer tok"},
-            )
 
 
 # ── Destroy script ─────────────────────────────────────────
