@@ -8,14 +8,13 @@ Run through these phases in order before public release. Each checkbox is a pass
 - [ ] Hetzner Cloud account with API token
 - [ ] Cloudflare account with: API token (Zone:DNS:Edit + Account:Cloudflare Tunnel:Edit), Account ID, Zone ID
 - [ ] GitHub org with admin access
-- [ ] GitHub PAT with scopes: `admin:org_hook` + `repo` (classic) or org webhooks write + contents read + pull requests write (fine-grained)
 - [ ] Claude Code auth token (`claude setup-token`)
 - [ ] SSH key pair in `~/.ssh/`
 
 ## Phase 1: Local Build & Test
 
 - [ ] `cp .env.example .env` and fill in all values
-- [ ] `just test` — all 90 tests pass
+- [ ] `just test` — all tests pass
 - [ ] `just build` — produces `cloud-init.yaml` without errors
 - [ ] `just validate` — cloud-init schema validates (if cloud-init CLI installed locally)
 - [ ] Inspect `cloud-init.yaml`: no `{{FILE:...}}` markers remain, agent code is embedded
@@ -29,8 +28,7 @@ Run through these phases in order before public release. Each checkbox is a pass
 - [ ] On server: `systemctl is-active caddy` returns `active`
 - [ ] On server: `systemctl is-active cloudflared` returns `active`
 - [ ] On server: `curl -s localhost:8080/health` returns `{"status":"healthy"}`
-- [ ] On server: `curl -s localhost:8081/health` returns `{"status":"healthy"}`
-- [ ] On server: `curl -s localhost:8081/ping` returns `pong`
+- [ ] On server: `curl -s localhost:8081/health` returns `{"status":"healthy"}` (Caddy internal health port)
 - [ ] On server: `sudo -u review gh auth status` shows authenticated
 - [ ] On server: `/opt/pr-review/.env` contains `CLAUDE_CODE_AUTH_TOKEN=...`
 - [ ] On server: `/opt/pr-review/.env` has `chmod 600` and owned by `review:review`
