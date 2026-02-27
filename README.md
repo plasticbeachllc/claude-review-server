@@ -1,18 +1,10 @@
 # Claude Review Server
 
-A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated in your GitHub org, the agent posts a concise, actionable review comment.
+A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated in your GitHub org, the agent posts a concise, actionable review comment. Force-pushes automatically collapse old reviews so the conversation stays clean.
 
 ```
 GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code → PR comment
 ```
-
----
-
-## What you get
-
-When someone opens or updates a PR in your org, the agent reads edited files and posts a review.
-
-When someone force-pushes, old reviews are automatically collapsed so the conversation stays clean.
 
 ---
 
@@ -105,12 +97,7 @@ Open `.env` in your editor. You need to fill in **7 values manually** — the re
 
 #### `CLAUDE_CODE_OAUTH_TOKEN`
 
-1. Open a terminal and run:
-   ```bash
-   claude setup-token
-   ```
-2. Follow the prompts — this outputs a token string
-3. Copy the full token string into `.env`
+Run `claude setup-token` locally, follow the prompts, and copy the resulting token into `.env`.
 
 #### `CF_API_TOKEN`
 
@@ -124,30 +111,21 @@ Open `.env` in your editor. You need to fill in **7 values manually** — the re
 6. Click **Continue to summary** → **Create Token**
 7. Copy the token — it's only shown once
 
-#### `CF_ACCOUNT_ID`
+#### `CF_ACCOUNT_ID` and `CF_ZONE_ID`
 
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. Click on any domain you own
-3. The **Account ID** is in the right sidebar under **API**
-4. Copy it
-
-#### `CF_ZONE_ID`
-
-1. Same page as Account ID (your domain's Overview page)
-2. The **Zone ID** is in the right sidebar under **API**, directly below Account ID
-3. Copy it
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/) → click your domain
+2. Both IDs are in the right sidebar under **API** — Account ID on top, Zone ID below
 
 #### `TUNNEL_HOSTNAME`
 
-Choose the public hostname for your review agent. This must be a subdomain of the domain you selected in the Cloudflare token setup.
-
-Example: if your domain is `example.com`, set this to `pr-review.example.com`.
+A subdomain of the domain you selected above, e.g. `pr-review.example.com`.
 
 #### `GITHUB_ORG`
 
-Your GitHub organization name exactly as it appears in the URL. For `github.com/my-org`, set this to `my-org`.
+Your GitHub org name as it appears in the URL (`github.com/my-org` → `my-org`).
 
-#### What your `.env` should look like after this step
+<details>
+<summary>What your <code>.env</code> should look like after this step</summary>
 
 ```env
 # ── Runtime ──────────────────────────────────────
@@ -181,22 +159,17 @@ TUNNEL_HOSTNAME=pr-review.example.com             # ← you filled this in
 GITHUB_ORG=my-org                                 # ← you filled this in
 ```
 
+</details>
+
 ### Step 2: Create the GitHub App
 
 ```bash
 just create-app
 ```
 
-This is a one-time interactive setup:
+This opens your browser twice — click **Create GitHub App**, then **Install** on your org. The script captures the credentials automatically.
 
-1. Your browser opens to GitHub — click **Create GitHub App** to approve
-2. GitHub redirects back and the script captures the app credentials
-3. Your browser opens again to install the app on your org — click **Install**
-4. The script detects the installation and saves everything
-
-When it finishes, your `.env` will have `GH_APP_ID`, `GH_INSTALLATION_ID`, and `GITHUB_WEBHOOK_SECRET` filled in, and a `github-app.pem` file will appear in your project root.
-
-**Do not** manually edit these four values — they are managed by the script.
+When it finishes, `GH_APP_ID`, `GH_INSTALLATION_ID`, `GITHUB_WEBHOOK_SECRET` are filled in your `.env` and a `github-app.pem` file appears in the project root. Don't edit these values manually.
 
 ### Step 3: Run tests
 
@@ -212,16 +185,7 @@ All tests should pass. If any fail, check your `.env` values — the tests valid
 just provision
 ```
 
-This takes 3–5 minutes and runs 8 automated stages:
-
-1. Validates your `.env`
-2. Builds `cloud-init.yaml` (embeds agent code into server config)
-3. Finds or uploads your SSH key to Hetzner
-4. Creates the Hetzner VM
-5. Waits for the server to boot and finish setup
-6. Injects your secrets (PEM, tokens) into the server securely
-7. Creates a Cloudflare Tunnel + DNS record
-8. Starts the review service
+This takes 3–5 minutes. It validates your config, creates the Hetzner VM, waits for it to boot, injects secrets, sets up the Cloudflare Tunnel + DNS, and starts the service.
 
 When it finishes, you'll see:
 
@@ -255,27 +219,15 @@ ssh root@<server-ip> journalctl -u pr-review -f
 
 ## Updating
 
-### Push code changes (hot deploy)
-
-After editing `src/agent.py` or `src/prompt.md` locally:
+After editing `src/agent.py` or `src/prompt.md`, hot-deploy without re-provisioning:
 
 ```bash
-just deploy root@<server-ip>
+just deploy root@<server-ip>     # copies files + restarts service
+just status                       # check health
+ssh root@<server-ip> journalctl -u pr-review -f   # tail logs
 ```
 
-This copies the files to the server, restarts the service, and takes effect immediately. No re-provisioning needed. (Find your server IP in the `just provision` output or via `just status`.)
-
-### Check server health
-
-```bash
-just status
-```
-
-### View logs
-
-```bash
-ssh root@<server-ip> journalctl -u pr-review -f
-```
+Find your server IP in the `just provision` output or via `just status`.
 
 ---
 
@@ -285,43 +237,18 @@ ssh root@<server-ip> journalctl -u pr-review -f
 just destroy yes
 ```
 
-This tears down all infrastructure in reverse order:
+Deletes the Hetzner server, Cloudflare Tunnel, and DNS record. The GitHub App is preserved — re-run `just provision` any time to recreate without repeating `just create-app`.
 
-1. Deletes the DNS record from Cloudflare
-2. Deletes the Cloudflare Tunnel
-3. Deletes the Hetzner server
-
-The GitHub App and SSH key are preserved. You can re-run `just provision` at any time to recreate the server without repeating `just create-app`.
-
-### Verify teardown
-
-- [Hetzner Console](https://console.hetzner.cloud/) → server should be gone
-- [Cloudflare Dashboard](https://dash.cloudflare.com/) → tunnel and DNS record should be gone
-- `just status` → should exit with code 3 (not found)
-
-### Reprovision from scratch
-
-```bash
-just destroy yes && just provision
-```
+Verify: `just status` should exit with code 3. To reprovision from scratch: `just destroy yes && just provision`.
 
 ---
 
 ## How it works
 
-1. **GitHub sends a webhook** when a PR is opened or updated
-2. **Signature verification** — the agent validates the HMAC-SHA256 signature; forged requests are rejected
-3. **Draft filtering** — draft PRs are skipped
-4. **Diff retrieval** — fetches edited files using the GitHub CLI
-5. **Full file context** — fetches complete contents of changed files via the GitHub API for richer review context
-6. **Smart truncation** — if truncation is necessary to fit context, lockfiles and generated code are dropped first
-7. **Claude reviews** — customizable prompt drives review mechanics
-8. **Comment posted** — the review appears as a PR comment within 1–2 minutes
-9. **Force-push handling** — prior reviews are collapsed under a `<details>` tag; ongoing reviews are restarted
-
-### Smart diff truncation
-
-Large PRs are truncated to fit context limits. Low-priority files — lockfiles, generated/minified code, snapshots, SVGs, and vendored code — are dropped first. Within each group, the largest files are dropped first. A note is added to the review listing which files were omitted.
+1. **Webhook received** — GitHub sends a PR event; the agent verifies the HMAC-SHA256 signature and skips drafts
+2. **Context gathered** — fetches the diff via `gh` CLI and full file contents via the GitHub API; large PRs are smart-truncated (lockfiles, generated code, and vendor files dropped first, largest files first)
+3. **Review posted** — Claude Code reviews the diff using a customizable prompt and posts a comment within 1–2 minutes
+4. **Force-push handling** — prior reviews are collapsed under a `<details>` tag; in-flight reviews are restarted
 
 ---
 
@@ -348,7 +275,8 @@ After editing, deploy with `just deploy root@<server-ip>`.
 
 ---
 
-## Project structure
+<details>
+<summary>Project structure</summary>
 
 ```
 src/
@@ -372,6 +300,8 @@ tests/
 Justfile                 # All commands: build, test, deploy, provision, destroy
 .env.example             # Configuration template
 ```
+
+</details>
 
 ---
 
