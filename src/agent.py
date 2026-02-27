@@ -43,6 +43,7 @@ except KeyError:
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
+DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "10"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
@@ -79,6 +80,7 @@ MAX_COMMENT_CHARS = 65_000  # GitHub comment limit is 65536
 class _PRReviewState:
     generation: int = 0
     process: subprocess.Popen | None = None
+    timer: threading.Timer | None = None
 
 _review_state: dict[str, _PRReviewState] = {}
 _review_state_lock = threading.Lock()
@@ -90,7 +92,12 @@ DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
 # ── Generation tracking ────────────────────────────────
 
 def _bump_generation(pr_key: str) -> int:
-    """Increment the generation counter for a PR; kill any in-flight Claude process."""
+    """Increment the generation counter for a PR.
+
+    Cancels any pending debounce timer and sends SIGTERM to any running
+    Claude process.  We intentionally do NOT call proc.wait() here —
+    the communicate() call in review_pr is the single authoritative wait.
+    """
     with _review_state_lock:
         state = _review_state.get(pr_key)
         if state is None:
@@ -102,17 +109,18 @@ def _bump_generation(pr_key: str) -> int:
         gen = state.generation
         proc = state.process
         state.process = None
+        timer = state.timer
+        state.timer = None
 
-    # Kill outside the lock to avoid holding it during process teardown.
+    # Cancel pending debounce timer.
+    if timer is not None:
+        timer.cancel()
+
+    # Signal process to exit; communicate() in review_pr handles the wait.
     if proc is not None:
         log.info(f"Killing superseded review for {pr_key} (gen {gen - 1})")
         try:
             proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
         except OSError:
             pass  # already dead
 
@@ -126,6 +134,30 @@ def _is_current(pr_key: str, generation: int) -> bool:
     with _review_state_lock:
         state = _review_state.get(pr_key)
         return state is not None and state.generation == generation
+
+
+def _schedule_review(
+    pr_key: str, delay: float,
+    repo: str, pr_number: int, title: str, action: str, generation: int,
+):
+    """Start a timer that submits review_pr after *delay* seconds.
+
+    The timer is registered in _review_state so that _bump_generation can
+    cancel it if a new push arrives before the timer fires.
+    """
+    def _submit():
+        if _is_current(pr_key, generation):
+            executor.submit(
+                review_pr, repo, pr_number, title, action,
+                pr_key, generation,
+            )
+
+    timer = threading.Timer(delay, _submit)
+    with _review_state_lock:
+        state = _review_state.get(pr_key)
+        if state is not None and state.generation == generation:
+            state.timer = timer
+    timer.start()
 
 
 # ── Helpers ─────────────────────────────────────────────
@@ -554,7 +586,8 @@ def review_pr(
             state = _review_state.get(pr_key)
             if (state is not None
                     and state.generation == generation
-                    and state.process is None):
+                    and state.process is None
+                    and state.timer is None):
                 del _review_state[pr_key]
 
 
@@ -627,9 +660,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
             pr_key = f"{repo}#{pr_number}"
             generation = _bump_generation(pr_key)
 
-            executor.submit(
-                review_pr, repo, pr_number, pr["title"], action,
-                pr_key, generation,
+            delay = 0 if action == "opened" else DEBOUNCE_SECONDS
+            _schedule_review(
+                pr_key, delay,
+                repo, pr_number, pr["title"], action, generation,
             )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             log.error(f"Malformed webhook payload: {e}")
@@ -650,32 +684,38 @@ class WebhookHandler(BaseHTTPRequestHandler):
         log.info(f"{self.client_address[0]} {fmt % args}")
 
 
+_shutdown_thread: threading.Thread | None = None  # set by _shutdown()
+
 if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
     server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
 
     def _do_shutdown():
         """Perform blocking shutdown work off the signal handler thread."""
+        if _shutting_down.is_set():
+            return  # guard against double-signal
         _shutting_down.set()
-        # Collect processes under the lock, then kill outside it.
+        # Collect processes and timers under the lock, act outside it.
         with _review_state_lock:
+            timers = [s.timer for s in _review_state.values()
+                      if s.timer is not None]
             procs = [s.process for s in _review_state.values()
                      if s.process is not None]
+        for timer in timers:
+            timer.cancel()
         for proc in procs:
             try:
-                proc.kill()
+                proc.terminate()  # graceful SIGTERM; communicate() handles wait
             except OSError:
                 pass
         server.shutdown()
         executor.shutdown(wait=True, cancel_futures=False)
 
-    _shutdown_thread: list[threading.Thread] = []
-
     def _shutdown(signum, _frame):
+        global _shutdown_thread
         log.info(f"Received {signal.Signals(signum).name}, shutting down...")
-        t = threading.Thread(target=_do_shutdown)
-        _shutdown_thread.append(t)
-        t.start()
+        _shutdown_thread = threading.Thread(target=_do_shutdown)
+        _shutdown_thread.start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -685,5 +725,5 @@ if __name__ == "__main__":
     server.serve_forever()
 
     # Join the shutdown thread so in-flight reviews finish before exit.
-    if _shutdown_thread:
-        _shutdown_thread[0].join()
+    if _shutdown_thread is not None:
+        _shutdown_thread.join()

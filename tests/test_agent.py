@@ -17,6 +17,7 @@ import pytest
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret-key")
 
 from agent import (
+    DEBOUNCE_SECONDS,
     REVIEW_MARKER,
     WebhookHandler,
     _bump_generation,
@@ -24,6 +25,7 @@ from agent import (
     _PRReviewState,
     _review_state,
     _review_state_lock,
+    _schedule_review,
     _shutting_down,
     already_reviewed,
     collapse_old_reviews,
@@ -1151,8 +1153,8 @@ class TestWebhookHandlerPost:
         assert status == 200
         assert json.loads(body)["ok"] is True
 
-    @patch("agent.executor")
-    def test_pr_opened_submits_review(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_pr_opened_submits_review(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="opened", number=42, title="My PR")
         sig = _sign_payload(payload)
         headers = {
@@ -1163,18 +1165,18 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        mock_executor.submit.assert_called_once()
-        call_args = mock_executor.submit.call_args
-        assert call_args[0][0] == review_pr
-        assert call_args[0][1] == "owner/repo"
-        assert call_args[0][2] == 42
-        assert call_args[0][3] == "My PR"
-        assert call_args[0][4] == "opened"
-        assert call_args[0][5] == "owner/repo#42"  # pr_key
-        assert isinstance(call_args[0][6], int)     # generation
+        mock_schedule.assert_called_once()
+        args = mock_schedule.call_args[0]
+        assert args[0] == "owner/repo#42"  # pr_key
+        assert args[1] == 0                # delay=0 for opened (no debounce)
+        assert args[2] == "owner/repo"     # repo
+        assert args[3] == 42              # pr_number
+        assert args[4] == "My PR"         # title
+        assert args[5] == "opened"        # action
+        assert isinstance(args[6], int)   # generation
 
-    @patch("agent.executor")
-    def test_pr_synchronize_submits_review(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_pr_synchronize_submits_review(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="synchronize", number=10)
         sig = _sign_payload(payload)
         headers = {
@@ -1185,15 +1187,16 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
 
-        mock_executor.submit.assert_called_once()
-        call_args = mock_executor.submit.call_args
-        assert call_args[0][0] == review_pr
-        assert call_args[0][1] == "owner/repo"
-        assert call_args[0][2] == 10
-        assert call_args[0][4] == "synchronize"
+        mock_schedule.assert_called_once()
+        call_args = mock_schedule.call_args
+        # Verify delay=DEBOUNCE_SECONDS for synchronize events
+        assert call_args[0][1] == DEBOUNCE_SECONDS
+        assert call_args[0][2] == "owner/repo"
+        assert call_args[0][3] == 10
+        assert call_args[0][5] == "synchronize"
 
-    @patch("agent.executor")
-    def test_pr_closed_does_not_submit(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_pr_closed_does_not_submit(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="closed")
         sig = _sign_payload(payload)
         headers = {
@@ -1203,10 +1206,10 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
-    @patch("agent.executor")
-    def test_draft_pr_skipped(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_draft_pr_skipped(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="opened", draft=True)
         sig = _sign_payload(payload)
         headers = {
@@ -1216,10 +1219,10 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
-    @patch("agent.executor")
-    def test_non_pr_event_ignored(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_non_pr_event_ignored(self, mock_schedule, http_server):
         payload = _make_pr_payload()
         sig = _sign_payload(payload)
         headers = {
@@ -1229,7 +1232,7 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
     def test_oversized_payload_returns_413(self, http_server):
         # Relies on do_POST checking Content-Length *before* reading the body.
@@ -1245,8 +1248,8 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 413
 
-    @patch("agent.executor")
-    def test_missing_event_header_returns_200_no_submit(self, mock_executor, http_server):
+    @patch("agent._schedule_review")
+    def test_missing_event_header_returns_200_no_submit(self, mock_schedule, http_server):
         """A valid signature but no X-GitHub-Event should return 200 but not submit."""
         payload = _make_pr_payload()
         sig = _sign_payload(payload)
@@ -1256,7 +1259,7 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
-        mock_executor.submit.assert_not_called()
+        mock_schedule.assert_not_called()
 
 
 # ── get_prompt_template ─────────────────────────────────
@@ -1324,6 +1327,9 @@ def _clean_review_state():
     """Reset module-level review state between tests."""
     yield
     with _review_state_lock:
+        for state in _review_state.values():
+            if state.timer is not None:
+                state.timer.cancel()
         _review_state.clear()
     _shutting_down.clear()
 
@@ -1348,31 +1354,25 @@ class TestBumpGeneration:
         _bump_generation(pr_key)
 
         mock_proc = MagicMock()
-        mock_proc.wait.return_value = 0
         with _review_state_lock:
             _review_state[pr_key].process = mock_proc
 
         _bump_generation(pr_key)
 
         mock_proc.terminate.assert_called_once()
+        mock_proc.wait.assert_not_called()  # communicate() is the sole wait
 
-    def test_kills_process_with_force_on_timeout(self):
+    def test_cancels_pending_timer_on_bump(self):
         pr_key = "org/repo#4"
         _bump_generation(pr_key)
 
-        mock_proc = MagicMock()
-        # First wait(timeout=5) raises TimeoutExpired; second wait() after kill succeeds.
-        mock_proc.wait.side_effect = [
-            subprocess.TimeoutExpired("claude", 5),
-            0,
-        ]
+        mock_timer = MagicMock()
         with _review_state_lock:
-            _review_state[pr_key].process = mock_proc
+            _review_state[pr_key].timer = mock_timer
 
         _bump_generation(pr_key)
 
-        mock_proc.terminate.assert_called_once()
-        mock_proc.kill.assert_called_once()
+        mock_timer.cancel.assert_called_once()
 
     def test_handles_already_dead_process(self):
         pr_key = "org/repo#5"
@@ -1431,12 +1431,8 @@ class TestReviewPrCancellation:
 
         review_pr("org/repo", 50, "title", "synchronize", pr_key, gen)
 
-        # subprocess.run should only have been called for collapse_old_reviews,
-        # not for diff fetch.
-        for call in mock_run.call_args_list:
-            args = call[0][0]
-            assert args[:3] != ["gh", "pr", "diff"], \
-                "Should not fetch diff for superseded review"
+        # _is_current fails before any subprocess calls, so nothing should run.
+        assert mock_run.call_count == 0
 
     @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
     @patch("agent.subprocess.Popen")
@@ -1530,3 +1526,109 @@ class TestReviewPrCancellation:
         for call in mock_run.call_args_list:
             args = call[0][0]
             assert args[:3] != ["gh", "pr", "comment"]
+
+
+class TestScheduleReview:
+    """Tests for _schedule_review debounce timer."""
+
+    @patch("agent.executor")
+    def test_immediate_submit_with_zero_delay(self, mock_executor):
+        """delay=0 fires the timer immediately, submitting to executor."""
+        pr_key = "org/repo#60"
+        gen = _bump_generation(pr_key)
+
+        _schedule_review(pr_key, 0, "org/repo", 60, "title", "opened", gen)
+
+        # Timer(0, ...) fires essentially immediately; give it a moment.
+        import time
+        time.sleep(0.1)
+
+        mock_executor.submit.assert_called_once()
+        call_args = mock_executor.submit.call_args
+        assert call_args[0][0] == review_pr
+        assert call_args[0][1] == "org/repo"
+        assert call_args[0][2] == 60
+        assert call_args[0][4] == "opened"
+        assert call_args[0][5] == pr_key
+        assert call_args[0][6] == gen
+
+    @patch("agent.executor")
+    def test_timer_registered_in_state(self, mock_executor):
+        """_schedule_review stores the timer in _review_state."""
+        pr_key = "org/repo#61"
+        gen = _bump_generation(pr_key)
+
+        _schedule_review(pr_key, 9999, "org/repo", 61, "title", "synchronize", gen)
+
+        with _review_state_lock:
+            state = _review_state[pr_key]
+            assert state.timer is not None
+
+        # Clean up — cancel the long timer
+        state.timer.cancel()
+
+    @patch("agent.executor")
+    def test_bump_cancels_pending_timer(self, mock_executor):
+        """A second bump cancels the first timer before it fires."""
+        import time
+
+        pr_key = "org/repo#62"
+        gen1 = _bump_generation(pr_key)
+
+        _schedule_review(pr_key, 9999, "org/repo", 62, "title", "synchronize", gen1)
+
+        with _review_state_lock:
+            timer1 = _review_state[pr_key].timer
+
+        # Second push arrives — cancels the pending timer.
+        gen2 = _bump_generation(pr_key)
+
+        # Timer.cancel() sets the internal finished event; wait for thread exit.
+        timer1.join(timeout=1)
+        assert timer1.is_alive() is False
+
+        # Schedule a new review with 0 delay.
+        _schedule_review(pr_key, 0, "org/repo", 62, "title", "synchronize", gen2)
+
+        time.sleep(0.1)
+
+        # Only the second review should have been submitted.
+        mock_executor.submit.assert_called_once()
+        call_args = mock_executor.submit.call_args
+        assert call_args[0][6] == gen2
+
+    @patch("agent.executor")
+    def test_stale_generation_prevents_submit(self, mock_executor):
+        """_schedule_review with a stale generation does not submit."""
+        import time
+
+        pr_key = "org/repo#63"
+        gen1 = _bump_generation(pr_key)
+        # Immediately supersede so _is_current(pr_key, gen1) is False.
+        _bump_generation(pr_key)
+
+        # Schedule with the stale generation — _submit callback will check
+        # _is_current and bail out.
+        _schedule_review(pr_key, 0, "org/repo", 63, "title", "synchronize", gen1)
+
+        time.sleep(0.1)
+
+        mock_executor.submit.assert_not_called()
+
+    @patch("agent.executor")
+    def test_rapid_syncs_coalesce(self, mock_executor):
+        """Multiple rapid synchronize events should coalesce into one review."""
+        pr_key = "org/repo#64"
+
+        # Simulate 3 rapid pushes (each bump cancels the previous timer).
+        for _ in range(3):
+            gen = _bump_generation(pr_key)
+
+        # Only schedule after the last push.
+        _schedule_review(pr_key, 0, "org/repo", 64, "title", "synchronize", gen)
+
+        import time
+        time.sleep(0.1)
+
+        mock_executor.submit.assert_called_once()
+        assert mock_executor.submit.call_args[0][6] == gen  # latest generation
