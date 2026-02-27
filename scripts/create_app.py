@@ -48,16 +48,20 @@ def _is_org(owner: str) -> bool:
     """Check whether a GitHub account is an organization (vs personal user)."""
     resp = requests.get(
         f"{GH_API}/users/{owner}",
-        headers={"Accept": "application/vnd.github+json"},
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
         timeout=15,
     )
     if resp.status_code != 200:
         print(
-            f"WARNING: Could not look up account type for '{owner}' "
-            f"(HTTP {resp.status_code}). Assuming organization.",
+            f"ERROR: Could not look up account type for '{owner}' "
+            f"(HTTP {resp.status_code}).\n"
+            f"Check that GITHUB_OWNER is correct in .env.",
             file=sys.stderr,
         )
-        return True
+        sys.exit(1)
     return resp.json().get("type") == "Organization"
 
 
@@ -230,8 +234,8 @@ def create_app(root: Path) -> dict:
 
     # Detect whether the account is an org or personal user.
     # The manifest creation URL differs between the two.
-    org = _is_org(owner)
-    account_label = "org" if org else "user"
+    is_org = _is_org(owner)
+    account_label = "org" if is_org else "user"
 
     # Random suffix avoids name collisions if re-creating the app.
     # GitHub App names must be globally unique.
@@ -262,7 +266,7 @@ def create_app(root: Path) -> dict:
     server = HTTPServer(("127.0.0.1", port), _ManifestHandler)
     server.manifest = manifest  # type: ignore[attr-defined]
     server.owner = owner  # type: ignore[attr-defined]
-    server.is_org = org  # type: ignore[attr-defined]
+    server.is_org = is_org  # type: ignore[attr-defined]
     server.expected_state = state  # type: ignore[attr-defined]
 
     print(f"[1/4] Starting local server on http://localhost:{port}")
