@@ -18,7 +18,7 @@ validate: build
     fi
     cloud-init schema --config-file cloud-init.yaml
 
-# Deploy agent files to a running server (requires root SSH access)
+# Deploy agent files to a running server (requires root SSH access, e.g. `root@<ip>`)
 deploy host:
     scp src/agent.py src/prompt.md {{host}}:/opt/pr-review/
     ssh {{host}} 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md && systemctl restart pr-review'
