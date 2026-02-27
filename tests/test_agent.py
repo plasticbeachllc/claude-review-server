@@ -3,15 +3,25 @@
 import hashlib
 import hmac
 import os
+import subprocess
 import textwrap
+import threading
 
 import pytest
+from unittest.mock import MagicMock, patch
 
 # Set required env var before importing agent
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret-key")
 
 from agent import (
+    _bump_generation,
+    _is_current,
+    _PRReviewState,
+    _review_state,
+    _review_state_lock,
+    _shutting_down,
     is_low_priority,
+    review_pr,
     smart_truncate_diff,
     verify_signature,
 )
@@ -198,3 +208,212 @@ class TestBuild:
         template.write_text("content: |\n  {{FILE:../../etc/passwd}}\n")
         with pytest.raises(BuildError, match="path traversal"):
             build(tmp_path)
+
+
+# ── Generation tracking ─────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clean_review_state():
+    """Reset module-level review state between tests."""
+    yield
+    with _review_state_lock:
+        _review_state.clear()
+    _shutting_down.clear()
+
+
+class TestBumpGeneration:
+    def test_first_bump_returns_1(self):
+        assert _bump_generation("org/repo#1") == 1
+
+    def test_successive_bumps_increment(self):
+        _bump_generation("org/repo#2")
+        assert _bump_generation("org/repo#2") == 2
+        assert _bump_generation("org/repo#2") == 3
+
+    def test_independent_prs_have_separate_generations(self):
+        assert _bump_generation("org/repo#10") == 1
+        assert _bump_generation("org/repo#20") == 1
+        assert _bump_generation("org/repo#10") == 2
+        assert _bump_generation("org/repo#20") == 2
+
+    def test_kills_active_process_on_bump(self):
+        pr_key = "org/repo#3"
+        _bump_generation(pr_key)
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = 0
+        with _review_state_lock:
+            _review_state[pr_key].process = mock_proc
+
+        _bump_generation(pr_key)
+
+        mock_proc.terminate.assert_called_once()
+
+    def test_kills_process_with_force_on_timeout(self):
+        pr_key = "org/repo#4"
+        _bump_generation(pr_key)
+
+        mock_proc = MagicMock()
+        mock_proc.wait.side_effect = subprocess.TimeoutExpired("claude", 5)
+        with _review_state_lock:
+            _review_state[pr_key].process = mock_proc
+
+        _bump_generation(pr_key)
+
+        mock_proc.terminate.assert_called_once()
+        mock_proc.kill.assert_called_once()
+
+    def test_handles_already_dead_process(self):
+        pr_key = "org/repo#5"
+        _bump_generation(pr_key)
+
+        mock_proc = MagicMock()
+        mock_proc.terminate.side_effect = OSError("No such process")
+        with _review_state_lock:
+            _review_state[pr_key].process = mock_proc
+
+        # Should not raise
+        gen = _bump_generation(pr_key)
+        assert gen == 2
+
+
+class TestIsCurrent:
+    def test_current_generation_returns_true(self):
+        gen = _bump_generation("org/repo#100")
+        assert _is_current("org/repo#100", gen) is True
+
+    def test_stale_generation_returns_false(self):
+        gen1 = _bump_generation("org/repo#101")
+        _bump_generation("org/repo#101")  # gen2
+        assert _is_current("org/repo#101", gen1) is False
+
+    def test_unknown_pr_returns_false(self):
+        assert _is_current("org/repo#999", 1) is False
+
+    def test_shutting_down_returns_false(self):
+        gen = _bump_generation("org/repo#102")
+        _shutting_down.set()
+        assert _is_current("org/repo#102", gen) is False
+
+
+class TestReviewPrCancellation:
+    """Test that review_pr bails out when superseded."""
+
+    def _mock_diff(self, returncode=0):
+        return MagicMock(
+            returncode=returncode,
+            stdout="diff --git a/f.py b/f.py\n+hello\n",
+            stderr="",
+        )
+
+    def _mock_body(self):
+        return MagicMock(returncode=0, stdout="PR body text")
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{diff}")
+    @patch("agent.subprocess.run")
+    def test_skips_diff_fetch_when_superseded(self, mock_run, _mock_tpl):
+        pr_key = "org/repo#50"
+        gen = _bump_generation(pr_key)
+        _bump_generation(pr_key)  # supersede
+
+        review_pr("org/repo", 50, "title", "synchronize", pr_key, gen)
+
+        # subprocess.run should only have been called for collapse_old_reviews,
+        # not for diff fetch.
+        for call in mock_run.call_args_list:
+            args = call[0][0]
+            assert args[:3] != ["gh", "pr", "diff"], \
+                "Should not fetch diff for superseded review"
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{diff}")
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    def test_skips_claude_when_superseded_after_diff(self, mock_run, mock_popen, _mock_tpl):
+        pr_key = "org/repo#51"
+        gen = _bump_generation(pr_key)
+
+        # subprocess.run calls: collapse_old_reviews (returns nothing), diff, body
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # collapse api
+            self._mock_diff(),  # diff
+            self._mock_body(),  # body
+        ]
+
+        # Supersede after diff fetch but before Claude. We do this by making
+        # _is_current return False on the second call (before Claude).
+        call_count = 0
+
+        def fake_is_current(key, g):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return True  # pass the first check (before diff)
+            return False  # fail the second check (before Claude)
+
+        with patch("agent._is_current", side_effect=fake_is_current):
+            review_pr("org/repo", 51, "title", "synchronize", pr_key, gen)
+
+        mock_popen.assert_not_called()
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{diff}")
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    def test_skips_posting_when_superseded_after_claude(self, mock_run, mock_popen, _mock_tpl):
+        pr_key = "org/repo#52"
+        gen = _bump_generation(pr_key)
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # collapse api
+            self._mock_diff(),  # diff
+            self._mock_body(),  # body
+        ]
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("Review output", "")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        call_count = 0
+
+        def fake_is_current(key, g):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return True  # pass checks before diff and before Claude
+            return False  # fail the check before posting
+
+        with patch("agent._is_current", side_effect=fake_is_current):
+            review_pr("org/repo", 52, "title", "synchronize", pr_key, gen)
+
+        # Should not have posted a comment
+        for call in mock_run.call_args_list:
+            args = call[0][0]
+            assert args[:3] != ["gh", "pr", "comment"], \
+                "Should not post comment for superseded review"
+
+    @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{diff}")
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    def test_handles_killed_claude_process(self, mock_run, mock_popen, _mock_tpl):
+        """When Claude is killed by signal, review_pr logs and exits cleanly."""
+        pr_key = "org/repo#53"
+        gen = _bump_generation(pr_key)
+
+        mock_run.side_effect = [
+            self._mock_diff(),  # diff (no collapse for "opened")
+            self._mock_body(),  # body
+        ]
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "")
+        mock_proc.returncode = -15  # killed by SIGTERM
+        mock_popen.return_value = mock_proc
+
+        # Should not raise
+        review_pr("org/repo", 53, "title", "opened", pr_key, gen)
+
+        # No comment posted
+        for call in mock_run.call_args_list:
+            args = call[0][0]
+            assert args[:3] != ["gh", "pr", "comment"]

@@ -7,10 +7,12 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -63,8 +65,59 @@ LOW_PRIORITY_PATTERNS = [
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
+
+# ── Per-PR review state (generation tracking + process handle) ───
+@dataclass
+class _PRReviewState:
+    generation: int = 0
+    process: subprocess.Popen | None = None
+
+_review_state: dict[str, _PRReviewState] = {}
+_review_state_lock = threading.Lock()
+_shutting_down = threading.Event()
+
 # Regex for extracting the filename from "diff --git a/path b/path"
 DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+# ── Generation tracking ────────────────────────────────
+
+def _bump_generation(pr_key: str) -> int:
+    """Increment the generation counter for a PR; kill any in-flight Claude process."""
+    with _review_state_lock:
+        state = _review_state.get(pr_key)
+        if state is None:
+            state = _PRReviewState(generation=1)
+            _review_state[pr_key] = state
+            return 1
+
+        state.generation += 1
+        gen = state.generation
+        proc = state.process
+        state.process = None
+
+    # Kill outside the lock to avoid holding it during process teardown.
+    if proc is not None:
+        log.info(f"Killing superseded review for {pr_key} (gen {gen - 1})")
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except OSError:
+            pass  # already dead
+
+    return gen
+
+
+def _is_current(pr_key: str, generation: int) -> bool:
+    """Return True if *generation* is still the latest for this PR."""
+    if _shutting_down.is_set():
+        return False
+    with _review_state_lock:
+        state = _review_state.get(pr_key)
+        return state is not None and state.generation == generation
+
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -184,17 +237,33 @@ def collapse_old_reviews(repo: str, pr_number: int):
         )
 
 
-def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
-    """Fetch diff, invoke Claude, post review comment."""
-    log.info(f"Reviewing {repo}#{pr_number}: {pr_title} ({action})")
+def review_pr(
+    repo: str,
+    pr_number: int,
+    pr_title: str,
+    action: str,
+    pr_key: str,
+    generation: int,
+):
+    """Fetch diff, invoke Claude, post review comment.
+
+    Bails out early if a newer generation supersedes this one (i.e. a new
+    push arrived while we were working).
+    """
+    log.info(f"Reviewing {pr_key}: {pr_title} ({action}) [gen={generation}]")
     try:
         if action == "opened" and already_reviewed(repo, pr_number):
-            log.info(f"Already reviewed {repo}#{pr_number}, skipping")
+            log.info(f"Already reviewed {pr_key}, skipping")
             return
 
         # Collapse old reviews on force-push
         if action == "synchronize":
             collapse_old_reviews(repo, pr_number)
+
+        # ── Check before diff fetch ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before diff fetch {pr_key} gen={generation}")
+            return
 
         diff_result = subprocess.run(
             ["gh", "pr", "diff", str(pr_number), "--repo", repo],
@@ -214,7 +283,7 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
         diff, truncation_note = smart_truncate_diff(diff_result.stdout)
 
         if not diff.strip():
-            log.warning(f"Empty diff for {repo}#{pr_number}")
+            log.warning(f"Empty diff for {pr_key}")
             return
 
         # Escape braces in untrusted content so .format() doesn't choke
@@ -231,18 +300,59 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             diff=esc(diff),
         )
 
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True, text=True, timeout=300,
-            cwd=str(WORKDIR),
-        )
-        if result.returncode != 0:
-            log.error(f"claude failed (exit {result.returncode}): {result.stderr}")
+        # ── Check before Claude invocation (the expensive step) ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before Claude call {pr_key} gen={generation}")
             return
 
-        review_text = result.stdout.strip()
+        # Use Popen so the webhook handler can kill us mid-flight.
+        proc = subprocess.Popen(
+            ["claude", "-p", prompt, "--output-format", "text"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(WORKDIR),
+        )
+
+        # Register process so _bump_generation can kill it.
+        with _review_state_lock:
+            state = _review_state.get(pr_key)
+            if state is not None and state.generation == generation:
+                state.process = proc
+            else:
+                # Already superseded between the check above and now.
+                proc.kill()
+                proc.wait()
+                return
+
+        try:
+            stdout, stderr = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            log.error(f"Claude timed out for {pr_key}")
+            return
+        finally:
+            # Unregister process handle.
+            with _review_state_lock:
+                state = _review_state.get(pr_key)
+                if state is not None and state.process is proc:
+                    state.process = None
+
+        if proc.returncode != 0:
+            # returncode < 0 means killed by signal (i.e. we cancelled it).
+            if proc.returncode < 0:
+                log.info(f"Claude killed (signal {-proc.returncode}) for {pr_key}")
+                return
+            log.error(f"claude failed (exit {proc.returncode}): {stderr}")
+            return
+
+        review_text = stdout.strip()
         if not review_text:
             log.warning("Empty review output")
+            return
+
+        # ── Final check before posting ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before posting {pr_key} gen={generation}")
             return
 
         header = "🔄 Updated Review" if action == "synchronize" else "📝 Review"
@@ -263,12 +373,12 @@ def review_pr(repo: str, pr_number: int, pr_title: str, action: str):
             log.error(f"Failed to post comment: {post_result.stderr}")
             return
 
-        log.info(f"Posted review for {repo}#{pr_number}")
+        log.info(f"Posted review for {pr_key} [gen={generation}]")
 
     except subprocess.TimeoutExpired:
-        log.error(f"Timeout reviewing {repo}#{pr_number}")
+        log.error(f"Timeout reviewing {pr_key}")
     except Exception as e:
-        log.error(f"Error reviewing {repo}#{pr_number}: {e}", exc_info=True)
+        log.error(f"Error reviewing {pr_key}: {e}", exc_info=True)
 
 
 # ── HTTP handler ────────────────────────────────────────
@@ -314,12 +424,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.info(f"Skipping draft PR #{pr['number']}")
             return
 
+        repo = data["repository"]["full_name"]
+        pr_number = pr["number"]
+        pr_key = f"{repo}#{pr_number}"
+        generation = _bump_generation(pr_key)
+
         executor.submit(
-            review_pr,
-            data["repository"]["full_name"],
-            pr["number"],
-            pr["title"],
-            action,
+            review_pr, repo, pr_number, pr["title"], action,
+            pr_key, generation,
         )
 
     def do_GET(self):
@@ -339,6 +451,30 @@ if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
     port = int(os.environ.get("PORT", "8080"))
     server = HTTPServer(("127.0.0.1", port), WebhookHandler)
+
+    def _shutdown(signum, _frame):
+        name = signal.Signals(signum).name
+        log.info(f"Received {name}, shutting down…")
+
+        def _do_shutdown():
+            _shutting_down.set()
+            # Kill any in-flight Claude processes.
+            with _review_state_lock:
+                for state in _review_state.values():
+                    if state.process is not None:
+                        try:
+                            state.process.kill()
+                        except OSError:
+                            pass
+            server.shutdown()
+            executor.shutdown(wait=True, cancel_futures=False)
+
+        # Run in a thread to avoid blocking the signal handler.
+        threading.Thread(target=_do_shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     log.info(f"PR Review Agent listening on 127.0.0.1:{port} "
              f"(workers={MAX_WORKERS})")
     server.serve_forever()
