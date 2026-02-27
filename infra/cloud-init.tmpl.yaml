@@ -67,13 +67,15 @@ write_files:
       ProtectSystem=strict
       ReadWritePaths=/opt/pr-review /home/review
       PrivateTmp=yes
-      ProtectHome=no              # gh config + Claude auth tokens live in ~review/
+      # gh config + Claude auth tokens live in ~review/
+      ProtectHome=no
       ProtectKernelTunables=yes
       ProtectKernelModules=yes
       ProtectControlGroups=yes
       RestrictNamespaces=yes
       RestrictSUIDSGID=yes
-      MemoryDenyWriteExecute=no   # Python JIT requires writable+executable memory
+      # Python JIT requires writable+executable memory
+      MemoryDenyWriteExecute=no
 
       [Install]
       WantedBy=multi-user.target

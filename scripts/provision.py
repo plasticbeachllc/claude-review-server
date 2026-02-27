@@ -337,6 +337,7 @@ def _upsert_env_var(ip: str, key: str, value: str, *, label: str = ""):
          f"TMPFILE=$(mktemp -p /opt/pr-review/) && "
          f"{{ grep -v '^{key}=' /opt/pr-review/.env || true; }} > \"$TMPFILE\" && "
          f"chmod 600 \"$TMPFILE\" && "
+         f"chown review:review \"$TMPFILE\" && "
          f"mv \"$TMPFILE\" /opt/pr-review/.env && "
          f"printf '{key}=%s\\n' \"${{VALUE}}\" >> /opt/pr-review/.env && "
          f"grep -q '^{key}=' /opt/pr-review/.env"],
