@@ -25,7 +25,6 @@ import html
 import json
 import os
 import secrets
-import socket
 import sys
 import textwrap
 import threading
@@ -225,18 +224,6 @@ class _ManifestHandler(BaseHTTPRequestHandler):
         pass  # Suppress default stderr logging
 
 
-def _bind_free_port() -> socket.socket:
-    """Bind a socket to a free port on localhost and return it.
-
-    The socket is kept open so the port cannot be grabbed by another
-    process before ``HTTPServer`` starts using it (avoids a TOCTOU race).
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
-    return sock
-
-
 # ---------------------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------------------
@@ -266,12 +253,14 @@ def create_app(root: Path) -> dict:
 
     # Detect whether the account is an org or personal user.
     # The manifest creation URL differs between the two.
-    # Done before _bind_free_port() so the socket isn't leaked if this exits.
     is_org = _is_org(owner)
     account_label = "org" if is_org else "user"
 
-    sock = _bind_free_port()
-    port = sock.getsockname()[1]
+    # Bind to port 0 — the OS assigns a free port atomically (no TOCTOU race,
+    # no leaked socket, no helper function needed).
+    server = _ManifestServer(("127.0.0.1", 0), _ManifestHandler)
+    port = server.server_address[1]
+
     state = secrets.token_hex(16)
     webhook_url = f"https://{hostname}/webhook"
 
@@ -299,13 +288,6 @@ def create_app(root: Path) -> dict:
         "default_events": ["pull_request"],
         "public": False,
     }
-
-    # Start local server — reuse the already-bound socket to avoid TOCTOU race.
-    # bind_and_activate=False prevents the constructor from binding a second
-    # time (which would fail with EADDRINUSE on the already-bound socket).
-    server = _ManifestServer(("127.0.0.1", port), _ManifestHandler, bind_and_activate=False)
-    server.socket = sock
-    server.server_activate()
     server.manifest = manifest
     server.owner = owner
     server.is_org = is_org
