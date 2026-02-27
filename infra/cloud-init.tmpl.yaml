@@ -9,14 +9,16 @@
 #   1. Set up a Cloudflare Tunnel pointing to http://localhost:80
 #      (see README for details)
 #
-#   2. Authenticate the review user:
-#        sudo -u review gh auth login          # GitHub OAuth
-#        sudo -u review claude                  # Claude subscription login
+#   2. Copy GitHub App credentials to the server:
+#        scp github-app.pem root@<ip>:/opt/pr-review/github-app.pem
+#        # Then add to /opt/pr-review/.env:
+#        #   GH_APP_ID=<from .env>
+#        #   GH_INSTALLATION_ID=<from .env>
+#        #   GH_APP_PRIVATE_KEY_FILE=/opt/pr-review/github-app.pem
+#        #   GITHUB_WEBHOOK_SECRET=<from .env>
 #
-#   3. Configure an org-level webhook in GitHub:
-#        URL:    https://<tunnel-hostname>/webhook
-#        Secret: (value from /opt/pr-review/.env)
-#        Events: Pull requests
+#   3. Authenticate Claude Code:
+#        sudo -u review claude
 #
 #   4. Start the service:
 #        sudo systemctl start pr-review
@@ -138,11 +140,9 @@ runcmd:
   # ── Create service user ───────────────────────────────────
   - useradd -r -m -s /bin/bash review
 
-  # ── Generate secrets and write env file ───────────────────
+  # ── Write env file skeleton (secrets are injected by provision.py) ──
   - |
-    WEBHOOK_SECRET=$(openssl rand -hex 32)
     {
-      echo "GITHUB_WEBHOOK_SECRET=${WEBHOOK_SECRET}"
       echo "REVIEW_WORKDIR=/opt/pr-review/workspace"
       echo "MAX_WORKERS=4"
       echo "PORT=8080"
@@ -187,13 +187,10 @@ runcmd:
     echo ""
     echo "  1. Set up Cloudflare Tunnel (see README)"
     echo ""
-    echo "  2. Authenticate:"
-    echo "       sudo -u review gh auth login"
-    echo "       sudo -u review claude"
+    echo "  2. Inject credentials:"
+    echo "       Copy github-app.pem and set env vars (see README)"
+    echo "       Authenticate Claude: sudo -u review claude"
     echo ""
     echo "  3. Start the agent:"
     echo "       systemctl start pr-review"
-    echo ""
-    echo "  4. Configure org webhook → https://<tunnel-hostname>/webhook"
-    echo "       Secret: grep WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2"
     echo "════════════════════════════════════════════════════════"

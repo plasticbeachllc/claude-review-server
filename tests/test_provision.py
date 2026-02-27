@@ -30,7 +30,10 @@ class TestLoadConfig:
     def _full_env(self, **overrides) -> str:
         defaults = {
             "HCLOUD_TOKEN": "hc-test-token",
-            "GH_TOKEN": "ghp_test",
+            "GH_APP_ID": "12345",
+            "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
+            "GH_INSTALLATION_ID": "67890",
+            "GITHUB_WEBHOOK_SECRET": "whsec_test",
             "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
             "CF_API_TOKEN": "cf-test-token",
             "CF_ACCOUNT_ID": "cf-account-123",
@@ -85,7 +88,7 @@ class TestLoadConfig:
             load_config(root)
         msg = str(exc.value)
         assert "HCLOUD_TOKEN" in msg
-        assert "GH_TOKEN" in msg
+        assert "GH_APP_ID" in msg
 
     def test_missing_env_file_raises(self, tmp_path):
         from _common import ProvisionError, load_config
@@ -106,12 +109,12 @@ class TestLoadConfig:
 
         env = self._full_env(
             HCLOUD_TOKEN='"hc-quoted-double"',
-            GH_TOKEN="'ghp-quoted-single'",
+            CF_API_TOKEN="'cf-quoted-single'",
         )
         root = self._write_env(tmp_path, env)
         config = load_config(root)
         assert config["HCLOUD_TOKEN"] == "hc-quoted-double"
-        assert config["GH_TOKEN"] == "ghp-quoted-single"
+        assert config["CF_API_TOKEN"] == "cf-quoted-single"
 
     def test_preserves_value_with_equals(self, tmp_path):
         from _common import load_config
@@ -334,82 +337,11 @@ class TestGhPaginate:
             )
 
 
-# ── GitHub webhook construction ────────────────────────────
-
-
-@pytest.mark.usefixtures("scripts_on_path")
-class TestCreateWebhook:
-    @patch("provision.gh_paginate", return_value=[])
-    @patch("provision.requests.post")
-    def test_posts_correct_payload(self, mock_post, mock_paginate):
-        from provision import create_webhook
-
-        mock_post.return_value = _gh_response(201, {"id": 42})
-
-        config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
-        create_webhook(config, "secret123", "pr-review.example.com")
-
-        call_kwargs = mock_post.call_args
-        payload = call_kwargs[1]["json"]
-        assert payload["config"]["url"] == "https://pr-review.example.com/webhook"
-        assert payload["config"]["secret"] == "secret123"
-        assert payload["events"] == ["pull_request"]
-        assert payload["active"] is True
-
-    @patch("provision.gh_paginate", return_value=[])
-    @patch("provision.requests.post")
-    def test_raises_on_failure(self, mock_post, mock_paginate):
-        from _common import ProvisionError
-        from provision import create_webhook
-
-        mock_post.return_value = _gh_response(422, text="Validation failed")
-
-        config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
-        with pytest.raises(ProvisionError, match="422"):
-            create_webhook(config, "secret", "host.example.com")
-
-    @patch("provision.gh_paginate")
-    @patch("provision.requests.post")
-    def test_skips_when_webhook_exists(self, mock_post, mock_paginate):
-        from provision import create_webhook
-
-        mock_paginate.return_value = [
-            {"id": 99, "config": {"url": "https://pr-review.example.com/webhook"}},
-        ]
-
-        config = {"GH_TOKEN": "ghp_test", "GITHUB_ORG": "myorg"}
-        create_webhook(config, "secret123", "pr-review.example.com")
-
-        mock_post.assert_not_called()
-
-
 # ── Destroy script ─────────────────────────────────────────
 
 
 @pytest.mark.usefixtures("scripts_on_path")
 class TestDestroy:
-    @patch("destroy.gh_paginate")
-    @patch("destroy.requests.delete")
-    def test_delete_webhook_finds_and_deletes(self, mock_delete, mock_paginate):
-        from destroy import delete_webhook
-
-        mock_paginate.return_value = [
-            {"id": 1, "config": {"url": "https://other.example.com/webhook"}},
-            {"id": 2, "config": {"url": "https://pr-review.example.com/webhook"}},
-        ]
-        mock_delete.return_value = MagicMock(status_code=204)
-
-        config = {
-            "GITHUB_ORG": "myorg",
-            "GH_TOKEN": "ghp_test",
-            "TUNNEL_HOSTNAME": "pr-review.example.com",
-        }
-        delete_webhook(config)
-
-        # Should delete hook id=2, not id=1
-        assert mock_delete.called
-        assert "/hooks/2" in mock_delete.call_args[0][0]
-
     @patch("destroy.Client")
     def test_delete_server_by_name(self, MockClient):
         from destroy import delete_server
@@ -423,38 +355,6 @@ class TestDestroy:
 
         mock_client.servers.delete.assert_called_once_with(mock_server)
 
-    @patch("destroy.gh_paginate")
-    def test_delete_webhook_passes_per_page(self, mock_paginate):
-        from destroy import delete_webhook
-
-        mock_paginate.return_value = []
-
-        config = {
-            "GITHUB_ORG": "myorg",
-            "GH_TOKEN": "ghp_test",
-            "TUNNEL_HOSTNAME": "pr-review.example.com",
-        }
-        delete_webhook(config)
-
-        # Verify per_page=100 is passed to gh_paginate
-        call_kwargs = mock_paginate.call_args
-        assert call_kwargs[1]["params"]["per_page"] == 100
-
-    @patch("destroy.gh_paginate")
-    def test_delete_webhook_raises_on_list_failure(self, mock_paginate):
-        from _common import ProvisionError
-        from destroy import delete_webhook
-
-        mock_paginate.side_effect = ProvisionError("GitHub API error (403): Forbidden")
-
-        config = {
-            "GITHUB_ORG": "myorg",
-            "GH_TOKEN": "ghp_test",
-            "TUNNEL_HOSTNAME": "pr-review.example.com",
-        }
-        with pytest.raises(ProvisionError, match="403"):
-            delete_webhook(config)
-
 
 # ── Auto-cleanup on provision failure ─────────────────────
 
@@ -465,15 +365,13 @@ class TestAutoCleanup:
         from provision import _auto_cleanup
 
         config = {"SERVER_NAME": "test", "GITHUB_ORG": "org", "TUNNEL_HOSTNAME": "h"}
-        created = {"server": "test", "tunnel": "h", "dns": "h", "webhook": "h"}
+        created = {"server": "test", "tunnel": "h", "dns": "h"}
 
-        with patch("provision.delete_webhook") as dw, \
-             patch("provision.delete_dns_record") as dd, \
+        with patch("provision.delete_dns_record") as dd, \
              patch("provision.delete_tunnel") as dt, \
              patch("provision.delete_server") as ds:
             _auto_cleanup(created, config)
 
-        dw.assert_called_once_with(config)
         dd.assert_called_once_with(config)
         dt.assert_called_once_with(config)
         ds.assert_called_once_with(config)
@@ -828,11 +726,19 @@ class TestWaitForCloudInit:
 
 @pytest.mark.usefixtures("scripts_on_path")
 class TestInjectAuth:
-    def _config(self):
-        return {
-            "GH_TOKEN": "ghp_test_token",
+    def _config(self, tmp_path=None):
+        config = {
+            "GH_APP_ID": "12345",
+            "GH_INSTALLATION_ID": "67890",
+            "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
+            "GITHUB_WEBHOOK_SECRET": "whsec_test",
             "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
         }
+        if tmp_path:
+            pem = tmp_path / "github-app.pem"
+            pem.write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+            config["GH_APP_PRIVATE_KEY_FILE"] = str(pem)
+        return config
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
@@ -850,53 +756,58 @@ class TestInjectAuth:
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
-    def test_raises_on_gh_auth_failure(self, mock_ssh, mock_run):
+    def test_raises_on_pem_injection_failure(self, mock_ssh, mock_run, tmp_path):
         from _common import ProvisionError
         from provision import inject_auth
 
-        # gh preflight succeeds
         mock_ssh.return_value = "/usr/bin/gh"
-        # gh auth login fails
+        # PEM copy fails
         mock_run.return_value = MagicMock(
-            returncode=1, stderr="auth error", stdout="",
+            returncode=1, stderr="permission denied", stdout="",
         )
 
-        with pytest.raises(ProvisionError, match="GitHub CLI auth failed"):
-            inject_auth("1.2.3.4", self._config())
+        with pytest.raises(ProvisionError, match="PEM injection failed"):
+            inject_auth("1.2.3.4", self._config(tmp_path))
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
-    def test_succeeds_with_all_steps(self, mock_ssh, mock_run):
+    def test_succeeds_with_all_steps(self, mock_ssh, mock_run, tmp_path):
         from provision import inject_auth
 
         mock_ssh.return_value = "/usr/bin/gh"
-        # 2 subprocess.run calls: gh auth, grep/mv upsert
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stderr="", stdout=""),  # gh auth login
-            MagicMock(returncode=0, stderr="", stdout=""),  # grep/mv upsert
-        ]
+        # 6 subprocess.run calls: PEM copy + 4 env vars + Claude token
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
-        inject_auth("1.2.3.4", self._config())  # should not raise
+        inject_auth("1.2.3.4", self._config(tmp_path))  # should not raise
 
-        assert mock_run.call_count == 2
+        # 1 PEM copy + 4 env var upserts (GH_APP_ID, GH_INSTALLATION_ID,
+        # GH_APP_PRIVATE_KEY_FILE, GITHUB_WEBHOOK_SECRET) + 1 Claude token
+        assert mock_run.call_count == 6
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
-    def test_pipes_gh_token_via_stdin(self, mock_ssh, mock_run):
+    def test_pipes_pem_via_stdin(self, mock_ssh, mock_run, tmp_path):
         from provision import inject_auth
 
         mock_ssh.return_value = "/usr/bin/gh"
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stderr="", stdout=""),
-            MagicMock(returncode=0, stderr="", stdout=""),
-        ]
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
-        inject_auth("1.2.3.4", self._config())
+        inject_auth("1.2.3.4", self._config(tmp_path))
 
-        # First subprocess.run call should pipe GH_TOKEN via stdin
+        # First subprocess.run call copies PEM content via stdin
         first_call = mock_run.call_args_list[0]
-        assert first_call[1]["input"] == "ghp_test_token"
+        assert "BEGIN RSA PRIVATE KEY" in first_call[1]["input"]
 
-        # Second subprocess.run call should pipe CLAUDE_CODE_AUTH_TOKEN via stdin
-        second_call = mock_run.call_args_list[1]
-        assert second_call[1]["input"] == "sk-ant-test"
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_raises_when_pem_missing(self, mock_ssh, mock_run):
+        from _common import ProvisionError
+        from provision import inject_auth
+
+        mock_ssh.return_value = "/usr/bin/gh"
+
+        config = self._config()
+        config["GH_APP_PRIVATE_KEY_FILE"] = "/nonexistent/path.pem"
+
+        with pytest.raises(ProvisionError, match="Private key not found"):
+            inject_auth("1.2.3.4", config)

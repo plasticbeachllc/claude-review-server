@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """GitHub PR Review Agent — webhook listener + Claude CLI reviewer."""
 
+import base64
 import hashlib
 import hmac
 import json
@@ -11,8 +12,10 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote
@@ -40,6 +43,18 @@ try:
     WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
 except KeyError:
     sys.exit("GITHUB_WEBHOOK_SECRET not set — add it to /opt/pr-review/.env")
+
+_APP_KEYS = ("GH_APP_ID", "GH_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_FILE")
+try:
+    GH_APP_ID = os.environ["GH_APP_ID"]
+    GH_INSTALLATION_ID = os.environ["GH_INSTALLATION_ID"]
+    GH_APP_PRIVATE_KEY_FILE = os.environ["GH_APP_PRIVATE_KEY_FILE"]
+except KeyError as e:
+    sys.exit(f"{e.args[0]} not set — add it to /opt/pr-review/.env")
+
+if not Path(GH_APP_PRIVATE_KEY_FILE).is_file():
+    sys.exit(f"Private key not found: {GH_APP_PRIVATE_KEY_FILE}")
+
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
@@ -48,6 +63,94 @@ REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
 _prompt_lock = threading.Lock()
+
+
+# ── GitHub App token management ──────────────────────────
+def _b64url(data: bytes) -> str:
+    """Base64url-encode *data* without padding."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _generate_jwt(app_id: str, private_key_path: str) -> str:
+    """Generate an RS256 JWT for GitHub App authentication.
+
+    Uses ``openssl dgst -sha256 -sign`` for RSA signing so that neither
+    PyJWT nor the ``cryptography`` package is required.
+    """
+    now = int(time.time())
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    payload = _b64url(json.dumps({
+        "iat": now - 60,
+        "exp": now + 10 * 60,
+        "iss": app_id,
+    }).encode())
+
+    signing_input = f"{header}.{payload}"
+
+    result = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", private_key_path],
+        input=signing_input.encode(),
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"openssl signing failed (rc={result.returncode}): "
+            f"{result.stderr.decode().strip()}"
+        )
+
+    signature = _b64url(result.stdout)
+    return f"{signing_input}.{signature}"
+
+
+@dataclass
+class _TokenCache:
+    token: str = ""
+    expires_at: float = 0.0
+
+_token_cache = _TokenCache()
+_token_lock = threading.Lock()
+
+
+def _get_installation_token() -> str:
+    """Get a valid GitHub App installation token, refreshing if needed.
+
+    Tokens are cached and refreshed when within 5 minutes of expiry.
+    Thread-safe via _token_lock.
+    """
+    with _token_lock:
+        if _token_cache.token and time.time() < (_token_cache.expires_at - 300):
+            return _token_cache.token
+
+        jwt = _generate_jwt(GH_APP_ID, GH_APP_PRIVATE_KEY_FILE)
+
+        # Exchange JWT for installation token via urllib (stdlib — no gh CLI needed
+        # since we don't have a token yet to authenticate gh with).
+        req = urllib.request.Request(
+            f"https://api.github.com/app/installations/"
+            f"{GH_INSTALLATION_ID}/access_tokens",
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {jwt}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+
+        _token_cache.token = data["token"]
+        # Conservative 58-minute cache (tokens last 60 minutes).
+        _token_cache.expires_at = time.time() + 3480
+        log.info("Refreshed GitHub App installation token")
+        return _token_cache.token
+
+
+def _gh_env() -> dict[str, str]:
+    """Return env dict with a fresh installation token for gh CLI calls."""
+    env = os.environ.copy()
+    env["GH_TOKEN"] = _get_installation_token()
+    return env
 
 
 def get_prompt_template() -> str:
@@ -313,7 +416,7 @@ def fetch_file_contents(
             ["gh", "api",
              f"repos/{repo}/contents/{encoded_path}?ref={head_sha}",
              "-H", "Accept: application/vnd.github.raw+json"],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, env=_gh_env(),
         )
         if result.returncode != 0:
             log.debug(f"Failed to fetch {filename} (rc={result.returncode})")
@@ -341,7 +444,7 @@ def already_reviewed(repo: str, pr_number: int) -> bool:
          "--json", "comments", "--jq",
          '[.comments[].body | select(contains("<!-- claude-review -->"))] '
          '| length'],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env=_gh_env(),
     )
     try:
         return int(result.stdout.strip()) > 0
@@ -360,7 +463,7 @@ def collapse_old_reviews(repo: str, pr_number: int):
          '.[] | select(.body | contains("<!-- claude-review -->")) '
          '| select(.body | contains("<details>") | not) '
          '| {id: .id, body: .body} | @json'],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env=_gh_env(),
     )
     if result.returncode != 0 or not result.stdout.strip():
         return
@@ -391,7 +494,7 @@ def collapse_old_reviews(repo: str, pr_number: int):
             ["gh", "api", "--method", "PATCH",
              f"/repos/{repo}/issues/comments/{comment_id}",
              "-f", f"body={collapsed}"],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, env=_gh_env(),
         )
 
 
@@ -425,7 +528,7 @@ def review_pr(
 
         diff_result = subprocess.run(
             ["gh", "pr", "diff", str(pr_number), "--repo", repo],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=_gh_env(),
         )
         if diff_result.returncode != 0:
             log.error(f"gh pr diff failed: {diff_result.stderr}")
@@ -435,7 +538,7 @@ def review_pr(
         pr_info_result = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--repo", repo,
              "--json", "body,headRefOid"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=_gh_env(),
         )
         pr_body = ""
         head_sha = ""
@@ -574,7 +677,7 @@ def review_pr(
         post_result = subprocess.run(
             ["gh", "pr", "comment", str(pr_number), "--repo", repo,
              "--body", comment],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=_gh_env(),
         )
         if post_result.returncode != 0:
             log.error(f"Failed to post comment: {post_result.stderr}")
