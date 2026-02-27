@@ -287,7 +287,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
         except (ValueError, TypeError):
             self.send_response(400)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
+            self.wfile.write(b'{"error":"invalid Content-Length"}')
             return
         if length > 5_000_000:  # 5 MB sanity limit
             log.warning(f"Payload too large ({length} bytes) from {self.client_address[0]}")
