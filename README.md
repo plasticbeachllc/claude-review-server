@@ -21,7 +21,7 @@ GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code 
 
 ## Prerequisites
 
-Install these on your local machine before starting:
+Install on your local machine:
 
 - [**just**](https://github.com/casey/just) — command runner (`brew install just` / `cargo install just`)
 - [**uv**](https://docs.astral.sh/uv/) — Python package manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
@@ -85,7 +85,7 @@ cd claude-review-server
 cp .env.example .env
 ```
 
-Open `.env` in your editor. You need to fill in **7 values manually** — the rest are either defaults or auto-populated later. Here is exactly where to find each one:
+Open `.env` in your editor. You need to fill in **7 values** — the rest are defaults or auto-populated later.
 
 #### `HCLOUD_TOKEN`
 
@@ -207,9 +207,7 @@ When it finishes, you'll see:
 just status
 ```
 
-This checks the server is running and the tunnel is reachable. You should see an `OK` status and exit code 0.
-
-Then open a PR on any repo in your org. Within 1–3 minutes, a review comment should appear. You can watch it happen live:
+You should see an OK status. Then open a PR on any repo in your org — a review comment should appear within 1–3 minutes. Watch it live:
 
 ```bash
 ssh root@<server-ip> journalctl -u pr-review -f
