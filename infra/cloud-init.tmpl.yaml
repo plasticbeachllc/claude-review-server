@@ -38,17 +38,10 @@ packages:
   - curl
 
 write_files:
-  # ── Main agent ────────────────────────────────────────────────
-  - path: /opt/pr-review/agent.py
-    permissions: "0755"
-    content: |
-      {{FILE:src/agent.py}}
-
-  # ── Review prompt template ──────────────────────────────────
-  - path: /opt/pr-review/prompt.md
-    permissions: "0644"
-    content: |
-      {{FILE:src/prompt.md}}
+  # ── Agent code (agent.py, prompt.md) is NOT embedded here ──
+  # These files are copied via SCP during provisioning (step 6 of
+  # `just provision`) because embedding them pushes cloud-init
+  # past Hetzner's 32 KB user_data limit.
 
   # ── Systemd service ───────────────────────────────────────
   - path: /etc/systemd/system/pr-review.service

@@ -108,16 +108,16 @@ class _ManifestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             # Serve the auto-submitting form page
             self._serve_form()
-        elif parsed.path == "/callback":
-            # GitHub redirects here with ?code=...&state=...
-            params = parse_qs(parsed.query)
-            states = params.get("state", [])
+        elif parsed.path.startswith("/callback/"):
+            # GitHub redirects here: /callback/{state}?code=...
+            path_state = parsed.path.removeprefix("/callback/")
             expected = getattr(self.server, "expected_state", None)
-            if expected and (not states or states[0] != expected):
+            if expected and path_state != expected:
                 self.server.callback_error = "Invalid state parameter"  # type: ignore[attr-defined]
                 self.server.callback_event.set()  # type: ignore[attr-defined]
                 self._respond(400, "Error: invalid state parameter.")
                 return
+            params = parse_qs(parsed.query)
             codes = params.get("code", [])
             if codes:
                 self.server.callback_code = codes[0]  # type: ignore[attr-defined]
@@ -218,7 +218,10 @@ def create_app(root: Path) -> dict:
             "url": webhook_url,
             "active": True,
         },
-        "redirect_url": f"http://localhost:{port}/callback?state={state}",
+        # State is embedded in the path (not as a query parameter) because
+        # GitHub's manifest validator rejects redirect_urls that contain
+        # query strings — GitHub appends its own ?code=... on redirect.
+        "redirect_url": f"http://localhost:{port}/callback/{state}",
         "default_permissions": {
             "contents": "read",
             "pull_requests": "write",

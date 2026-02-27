@@ -350,6 +350,31 @@ def _upsert_env_var(ip: str, key: str, value: str, *, label: str = ""):
         )
 
 
+def deploy_agent_files(ip: str, root: Path):
+    """Copy agent.py and prompt.md to the server via SCP.
+
+    These files are not embedded in cloud-init because Hetzner's user_data
+    limit is 32 KB and agent.py alone exceeds that.
+    """
+    src_dir = root / "src"
+    for filename in ("agent.py", "prompt.md"):
+        local = src_dir / filename
+        if not local.is_file():
+            raise ProvisionError(f"Source file not found: {local}")
+        result = subprocess.run(
+            ["scp", *SSH_OPTS, str(local), f"root@{ip}:/opt/pr-review/{filename}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise ProvisionError(
+                f"Failed to copy {filename} to server (rc={result.returncode})\n"
+                f"stderr: {result.stderr.strip()}"
+            )
+    # Fix ownership (cloud-init creates the directory as root)
+    ssh(ip, "chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md")
+    print("  Copied agent.py and prompt.md to server")
+
+
 def inject_auth(ip: str, config: dict):
     """Inject GitHub App credentials and Claude auth tokens into the server.
 
@@ -569,15 +594,15 @@ def main():
 
     try:
         # 1. Config
-        print("[1/8] Loading configuration...")
+        print("[1/9] Loading configuration...")
         config = load_config(root)
 
         # 2. Build cloud-init
-        print("[2/8] Building cloud-init.yaml...")
+        print("[2/9] Building cloud-init.yaml...")
         cloud_init = build(root)
 
         # 3. SSH key
-        print("[3/8] Setting up SSH key...")
+        print("[3/9] Setting up SSH key...")
         pubkey = find_local_pubkey(config)
         client = Client(token=config["HCLOUD_TOKEN"])
         ssh_key, key_created = ensure_ssh_key(client, pubkey, name=config["SERVER_NAME"])
@@ -585,29 +610,33 @@ def main():
             created["ssh_key"] = ssh_key.name
 
         # 4. Create server
-        print("[4/8] Creating Hetzner server...")
+        print("[4/9] Creating Hetzner server...")
         server = create_server(client, config, ssh_key, cloud_init)
         ip = server.public_net.ipv4.ip
         created["server"] = config["SERVER_NAME"]
         print(f"  Server IP: {ip}")
 
         # 5. Wait for boot
-        print("[5/8] Waiting for server to be ready...")
+        print("[5/9] Waiting for server to be ready...")
         wait_for_ssh(ip)
         wait_for_cloud_init(ip)
 
-        # 6. Inject auth
-        print("[6/8] Injecting auth tokens...")
+        # 6. Deploy agent files (not embedded in cloud-init due to 32KB limit)
+        print("[6/9] Deploying agent code...")
+        deploy_agent_files(ip, root)
+
+        # 7. Inject auth
+        print("[7/9] Injecting auth tokens...")
         inject_auth(ip, config)
 
-        # 7. Cloudflare Tunnel (setup_tunnel updates `created` progressively)
-        print("[7/8] Setting up Cloudflare Tunnel...")
+        # 8. Cloudflare Tunnel (setup_tunnel updates `created` progressively)
+        print("[8/9] Setting up Cloudflare Tunnel...")
         hostname = setup_tunnel(config, ip, created=created)
 
-        # 8. Enable + start service (webhook is configured by `just create-app`)
+        # 9. Enable + start service (webhook is configured by `just create-app`)
         # Enable here (not in cloud-init) so a premature reboot before auth
         # injection won't cause crash-loop restarts.
-        print("[8/8] Starting service...")
+        print("[9/9] Starting service...")
         ssh(ip, "systemctl enable --now pr-review")
 
         # Verify the service actually started (retry to allow systemd to settle)
