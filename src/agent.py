@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import quote
 
 # ── Structured JSON logging ──────────────────────────────
 class JSONFormatter(logging.Formatter):
@@ -35,9 +36,13 @@ logging.root.setLevel(logging.INFO)
 log = logging.getLogger("pr-review")
 
 # ── Configuration ────────────────────────────────────────
-WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]  # tests must set before import
+try:
+    WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
+except KeyError:
+    sys.exit("GITHUB_WEBHOOK_SECRET not set — add it to /opt/pr-review/.env")
 WORKDIR = Path(os.environ.get("REVIEW_WORKDIR", "/opt/pr-review/workspace"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
+MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
 REVIEW_MARKER = "<!-- claude-review -->"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
@@ -55,7 +60,8 @@ def get_prompt_template() -> str:
 
 # Files to drop first when truncating large diffs
 LOW_PRIORITY_PATTERNS = [
-    r"(package-lock|yarn\.lock|pnpm-lock|Cargo\.lock|go\.sum|composer\.lock)",
+    r"(package-lock|yarn\.lock|pnpm-lock|Cargo\.lock|go\.sum|composer\.lock|"
+    r"uv\.lock|poetry\.lock|Pipfile\.lock|Gemfile\.lock|bun\.lockb)",
     r"\.(generated|min)\.(js|css|ts)$",
     r"__snapshots__/",
     r"\.svg$",
@@ -64,6 +70,8 @@ LOW_PRIORITY_PATTERNS = [
 ]
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+PORT = int(os.environ.get("PORT", "8080"))
+MAX_COMMENT_CHARS = 65_000  # GitHub comment limit is 65536
 
 
 # ── Per-PR review state (generation tracking + process handle) ───
@@ -104,6 +112,7 @@ def _bump_generation(pr_key: str) -> int:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait()
         except OSError:
             pass  # already dead
 
@@ -182,6 +191,117 @@ def smart_truncate_diff(diff: str, max_chars: int = 40_000) -> tuple[str, str]:
     return "".join(kept), note
 
 
+def extract_diff_filenames(diff: str) -> list[str]:
+    """Extract unique filenames from a unified diff, excluding deleted files."""
+    filenames: list[str] = []
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        m = DIFF_HEADER_RE.match(lines[i])
+        if m:
+            filename = m.group(2)
+            # Check next few lines for "deleted file mode" or "+++ /dev/null"
+            is_deleted = False
+            for j in range(i + 1, min(i + 6, len(lines))):
+                if lines[j].startswith("diff --git"):
+                    break
+                if "deleted file mode" in lines[j] or lines[j] == "+++ /dev/null":
+                    is_deleted = True
+                    break
+            if not is_deleted and filename not in filenames:
+                filenames.append(filename)
+        i += 1
+    return filenames
+
+
+def format_file_contents(
+    files: list[tuple[str, str]], max_chars: int = 80_000,
+) -> tuple[str, str]:
+    """Format file contents with priority-based truncation.
+
+    Returns (formatted_contents, truncation_note).
+
+    Note: the is_low_priority sort is intentionally kept even though
+    fetch_file_contents already filters low-priority files. This makes
+    format_file_contents safe for standalone use with arbitrary inputs.
+    """
+    if not files:
+        return "", ""
+
+    # Sort: high-priority first, then smaller files first (defensive —
+    # callers may pass unfiltered file lists)
+    sorted_files = sorted(files, key=lambda x: (is_low_priority(x[0]), len(x[1])))
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    total = 0
+    for name, content in sorted_files:
+        entry = f"### {name}\n~~~\n{content}\n~~~\n"
+        if total + len(entry) <= max_chars:
+            kept.append(entry)
+            total += len(entry)
+        else:
+            dropped.append(name)
+
+    note = ""
+    if dropped:
+        note = (
+            f"({len(dropped)} file(s) contents omitted: "
+            f"{', '.join(dropped[:10])}"
+            f"{'...' if len(dropped) > 10 else ''})"
+        )
+
+    return "".join(kept), note
+
+
+def fetch_file_contents(
+    repo: str, head_sha: str, filenames: list[str],
+) -> list[tuple[str, str]]:
+    """Fetch full file contents from the PR head ref via GitHub API.
+
+    Skips low-priority, binary, and oversized (>50 KB) files.
+    Fetches at most 15 files to limit API calls.
+    """
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        log.warning(f"Invalid repo format: {repo!r}")
+        return []
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        log.warning(f"Invalid head SHA format: {head_sha!r}")
+        return []
+
+    targets = [f for f in filenames if not is_low_priority(f)][:15]
+    files: list[tuple[str, str]] = []
+
+    for filename in targets:
+        encoded_path = quote(filename, safe="/")
+        # capture_output without text=True is intentional: we need raw
+        # bytes to detect binary content (null-byte check) before
+        # decoding as UTF-8.
+        result = subprocess.run(
+            ["gh", "api",
+             f"repos/{repo}/contents/{encoded_path}?ref={head_sha}",
+             "-H", "Accept: application/vnd.github.raw+json"],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            log.debug(f"Failed to fetch {filename} (rc={result.returncode})")
+            continue
+        # Decode as UTF-8; null bytes are a strong binary signal
+        content = result.stdout.decode("utf-8", errors="replace")
+        if not content:
+            log.debug(f"Skipping empty file: {filename}")
+            continue
+        if "\x00" in content[:8192]:
+            log.debug(f"Skipping binary file: {filename}")
+            continue
+        if len(content) > 50_000:
+            log.debug(f"Skipping oversized file ({len(content)} chars): {filename}")
+            continue
+        files.append((filename, content))
+
+    return files
+
+
 def already_reviewed(repo: str, pr_number: int) -> bool:
     """Check if we already posted a review comment on this PR."""
     result = subprocess.run(
@@ -256,14 +376,14 @@ def review_pr(
             log.info(f"Already reviewed {pr_key}, skipping")
             return
 
+        # ── Check before any work (avoids wasted API calls) ──
+        if not _is_current(pr_key, generation):
+            log.info(f"Superseded before start {pr_key} gen={generation}")
+            return
+
         # Collapse old reviews on force-push
         if action == "synchronize":
             collapse_old_reviews(repo, pr_number)
-
-        # ── Check before diff fetch ──
-        if not _is_current(pr_key, generation):
-            log.info(f"Superseded before diff fetch {pr_key} gen={generation}")
-            return
 
         diff_result = subprocess.run(
             ["gh", "pr", "diff", str(pr_number), "--repo", repo],
@@ -273,18 +393,55 @@ def review_pr(
             log.error(f"gh pr diff failed: {diff_result.stderr}")
             return
 
-        body_result = subprocess.run(
+        # Fetch PR metadata (body + head SHA) in one call
+        pr_info_result = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--repo", repo,
-             "--json", "body", "--jq", ".body"],
+             "--json", "body,headRefOid"],
             capture_output=True, text=True, timeout=30,
         )
-        pr_body = body_result.stdout.strip() if body_result.returncode == 0 else ""
+        pr_body = ""
+        head_sha = ""
+        if pr_info_result.returncode == 0:
+            try:
+                pr_info = json.loads(pr_info_result.stdout)
+                pr_body = pr_info.get("body", "").strip()
+                head_sha = pr_info.get("headRefOid", "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
 
         diff, truncation_note = smart_truncate_diff(diff_result.stdout)
 
         if not diff.strip():
             log.warning(f"Empty diff for {pr_key}")
             return
+
+        # Fetch full contents of changed files for richer context
+        file_section = ""
+        if head_sha:
+            filenames = extract_diff_filenames(diff_result.stdout)
+            fetchable = [f for f in filenames if not is_low_priority(f)]
+            raw_files = fetch_file_contents(repo, head_sha, fetchable)
+            file_contents_str, file_note = format_file_contents(
+                raw_files, max_chars=MAX_FILE_CHARS,
+            )
+            # Surface the 15-file fetch cap if it was hit
+            notes = []
+            capped = len(fetchable) - 15
+            if capped > 0:
+                names = ", ".join(fetchable[15:25])
+                suffix = "..." if capped > 10 else ""
+                notes.append(
+                    f"({capped} file(s) exceeded 15-file fetch limit: "
+                    f"{names}{suffix})"
+                )
+            if file_note:
+                notes.append(file_note)
+
+            if file_contents_str:
+                parts = ["Full contents of changed files for context:"]
+                parts.extend(notes)
+                parts.append(file_contents_str)
+                file_section = "\n\n".join(parts)
 
         # Escape braces in untrusted content so .format() doesn't choke
         # on diffs/bodies containing {variable_name} patterns.
@@ -297,8 +454,11 @@ def review_pr(
             pr_title=esc(pr_title),
             pr_body=esc(pr_body) or "(none)",
             truncation_note=truncation_note,
+            file_contents=esc(file_section),
             diff=esc(diff),
         )
+        # Collapse runs of blank lines left by empty placeholders
+        prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
         # ── Check before Claude invocation (the expensive step) ──
         if not _is_current(pr_key, generation):
@@ -356,12 +516,21 @@ def review_pr(
             return
 
         header = "🔄 Updated Review" if action == "synchronize" else "📝 Review"
+        footer = "\n\n---\n*Automated review by Claude Code*"
+
+        # Truncate if review would exceed GitHub's comment size limit
+        overhead = len(f"{REVIEW_MARKER}\n## {header}\n\n") + len(footer)
+        max_review = MAX_COMMENT_CHARS - overhead
+        if len(review_text) > max_review:
+            truncation_msg = "\n\n*(Review truncated — exceeded GitHub comment size limit)*"
+            review_text = review_text[:max_review - len(truncation_msg)] + truncation_msg
+            log.warning(f"Truncated review for {pr_key} to fit comment limit")
+
         comment = (
             f"{REVIEW_MARKER}\n"
             f"## {header}\n\n"
-            f"{review_text}\n\n"
-            f"---\n"
-            f"*Automated review by Claude Code*"
+            f"{review_text}"
+            f"{footer}"
         )
 
         post_result = subprocess.run(
@@ -379,6 +548,14 @@ def review_pr(
         log.error(f"Timeout reviewing {pr_key}")
     except Exception as e:
         log.error(f"Error reviewing {pr_key}: {e}", exc_info=True)
+    finally:
+        # Prune state entry to prevent unbounded memory growth.
+        with _review_state_lock:
+            state = _review_state.get(pr_key)
+            if (state is not None
+                    and state.generation == generation
+                    and state.process is None):
+                del _review_state[pr_key]
 
 
 # ── HTTP handler ────────────────────────────────────────
@@ -390,11 +567,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            body = b'{"error":"invalid Content-Length"}'
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if length > 5_000_000:  # 5 MB sanity limit
             log.warning(f"Payload too large ({length} bytes) from {self.client_address[0]}")
+            body = b'{"error":"payload too large"}'
             self.send_response(413)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
 
         payload = self.rfile.read(length)
@@ -402,43 +592,56 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if not verify_signature(payload, signature):
             log.warning(f"Invalid signature from {self.client_address[0]}")
+            body = b'{"error":"invalid signature"}'
             self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
 
+        body = b'{"ok":true}'
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b'{"ok":true}')
+        self.wfile.write(body)
 
         event = self.headers.get("X-GitHub-Event", "")
         if event != "pull_request":
             return
 
-        data = json.loads(payload)
-        action = data.get("action")
-        if action not in ("opened", "synchronize"):
-            return
+        try:
+            data = json.loads(payload)
+            action = data.get("action")
+            if action not in ("opened", "synchronize"):
+                return
 
-        pr = data["pull_request"]
-        if pr.get("draft", False):
-            log.info(f"Skipping draft PR #{pr['number']}")
-            return
+            pr = data["pull_request"]
+            if pr.get("draft", False):
+                log.info(f"Skipping draft PR #{pr['number']}")
+                return
 
-        repo = data["repository"]["full_name"]
-        pr_number = pr["number"]
-        pr_key = f"{repo}#{pr_number}"
-        generation = _bump_generation(pr_key)
+            repo = data["repository"]["full_name"]
+            pr_number = pr["number"]
+            pr_key = f"{repo}#{pr_number}"
+            generation = _bump_generation(pr_key)
 
-        executor.submit(
-            review_pr, repo, pr_number, pr["title"], action,
-            pr_key, generation,
-        )
+            executor.submit(
+                review_pr, repo, pr_number, pr["title"], action,
+                pr_key, generation,
+            )
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            log.error(f"Malformed webhook payload: {e}")
 
     def do_GET(self):
         if self.path == "/health":
+            body = b'{"status":"healthy"}'
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b'{"status":"healthy"}')
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -449,32 +652,38 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("127.0.0.1", port), WebhookHandler)
+    server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
+
+    def _do_shutdown():
+        """Perform blocking shutdown work off the signal handler thread."""
+        _shutting_down.set()
+        # Collect processes under the lock, then kill outside it.
+        with _review_state_lock:
+            procs = [s.process for s in _review_state.values()
+                     if s.process is not None]
+        for proc in procs:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        server.shutdown()
+        executor.shutdown(wait=True, cancel_futures=False)
+
+    _shutdown_thread: list[threading.Thread] = []
 
     def _shutdown(signum, _frame):
-        name = signal.Signals(signum).name
-        log.info(f"Received {name}, shutting down…")
-
-        def _do_shutdown():
-            _shutting_down.set()
-            # Kill any in-flight Claude processes.
-            with _review_state_lock:
-                for state in _review_state.values():
-                    if state.process is not None:
-                        try:
-                            state.process.kill()
-                        except OSError:
-                            pass
-            server.shutdown()
-            executor.shutdown(wait=True, cancel_futures=False)
-
-        # Run in a thread to avoid blocking the signal handler.
-        threading.Thread(target=_do_shutdown, daemon=True).start()
+        log.info(f"Received {signal.Signals(signum).name}, shutting down...")
+        t = threading.Thread(target=_do_shutdown)
+        _shutdown_thread.append(t)
+        t.start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log.info(f"PR Review Agent listening on 127.0.0.1:{port} "
+    log.info(f"PR Review Agent listening on 127.0.0.1:{PORT} "
              f"(workers={MAX_WORKERS})")
     server.serve_forever()
+
+    # Join the shutdown thread so in-flight reviews finish before exit.
+    if _shutdown_thread:
+        _shutdown_thread[0].join()
