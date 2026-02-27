@@ -10,7 +10,7 @@ validate: build
     #!/usr/bin/env bash
     if ! command -v cloud-init &>/dev/null; then
         echo "Note: cloud-init not installed, skipping validation"
-        exit 0
+        exit 1
     fi
     cloud-init schema --config-file cloud-init.yaml
 
