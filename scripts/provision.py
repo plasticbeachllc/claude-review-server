@@ -199,6 +199,10 @@ def _upsert_env_var(ip: str, key: str, value: str, *, label: str = ""):
     """Upsert a single key=value into the server's /opt/pr-review/.env.
 
     Value is piped via stdin to avoid exposing it in process args.
+
+    NOTE: ``key`` is interpolated into the remote shell command.  This is safe
+    because all callers pass hard-coded key names (``GH_APP_ID`` etc.), never
+    user-supplied input.  Do not expose this as a general-purpose API.
     """
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",

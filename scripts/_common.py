@@ -7,8 +7,6 @@ from pathlib import Path
 
 import requests
 
-from _jwt import generate_jwt  # noqa: F401 — re-exported for use by other scripts
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------

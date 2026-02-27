@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -76,6 +77,10 @@ def _generate_jwt(app_id: str, private_key_path: str) -> str:
 
     Uses ``openssl dgst -sha256 -sign`` for RSA signing so that neither
     PyJWT nor the ``cryptography`` package is required.
+
+    NOTE: This is intentionally duplicated from ``scripts/_jwt.py`` because
+    ``agent.py`` is a standalone file embedded in cloud-init and cannot
+    import from ``scripts/``.  If you fix a bug here, update ``_jwt.py`` too.
     """
     now = int(time.time())
     header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
@@ -136,12 +141,27 @@ def _get_installation_token() -> str:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            raise RuntimeError(
+                f"GitHub token exchange failed ({e.code}): {body}"
+            ) from e
 
         _token_cache.token = data["token"]
-        # Conservative 58-minute cache (tokens last 60 minutes).
-        _token_cache.expires_at = time.time() + 3480
+        # Use the actual expiry from GitHub's response, with a 5-minute buffer.
+        expires_str = data.get("expires_at", "")
+        if expires_str:
+            from datetime import datetime, timezone
+            expires_at = datetime.fromisoformat(
+                expires_str.replace("Z", "+00:00")
+            )
+            _token_cache.expires_at = expires_at.timestamp()
+        else:
+            # Fallback: conservative 58-minute cache (tokens last 60 minutes).
+            _token_cache.expires_at = time.time() + 3480
         log.info("Refreshed GitHub App installation token")
         return _token_cache.token
 

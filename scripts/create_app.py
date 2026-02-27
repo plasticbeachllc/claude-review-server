@@ -86,10 +86,12 @@ def _upsert_env(path: Path, updates: dict[str, str]):
 # Manifest flow HTTP handler
 # ---------------------------------------------------------------------------
 class _ManifestHandler(BaseHTTPRequestHandler):
-    """Handles the GitHub App manifest creation redirect flow."""
+    """Handles the GitHub App manifest creation redirect flow.
 
-    code: str | None = None
-    error: str | None = None
+    Results are stored on the *server* instance (not class variables) so
+    that the main thread can read them without relying on class-level
+    mutation from the server thread.
+    """
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -102,10 +104,10 @@ class _ManifestHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             codes = params.get("code", [])
             if codes:
-                _ManifestHandler.code = codes[0]
+                self.server.callback_code = codes[0]  # type: ignore[attr-defined]
                 self._respond(200, "App created! You can close this tab.")
             else:
-                _ManifestHandler.error = "No code in callback"
+                self.server.callback_error = "No code in callback"  # type: ignore[attr-defined]
                 self._respond(400, "Error: no code parameter received.")
         else:
             self.send_response(404)
@@ -210,9 +212,9 @@ def create_app(root: Path) -> dict:
     print(f"  Webhook URL: {webhook_url}")
     print()
 
-    # Reset handler state
-    _ManifestHandler.code = None
-    _ManifestHandler.error = None
+    # Store callback results on the server instance (read by main thread)
+    server.callback_code = None  # type: ignore[attr-defined]
+    server.callback_error = None  # type: ignore[attr-defined]
 
     # Serve in a background thread
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -224,21 +226,21 @@ def create_app(root: Path) -> dict:
     print("  Waiting for you to approve the app on GitHub...", end="", flush=True)
     deadline = time.time() + 300
     while time.time() < deadline:
-        if _ManifestHandler.code or _ManifestHandler.error:
+        if server.callback_code or server.callback_error:  # type: ignore[attr-defined]
             break
         print(".", end="", flush=True)
         time.sleep(2)
 
     server.shutdown()
 
-    if _ManifestHandler.error:
-        print(f"\nERROR: {_ManifestHandler.error}", file=sys.stderr)
+    if server.callback_error:  # type: ignore[attr-defined]
+        print(f"\nERROR: {server.callback_error}", file=sys.stderr)
         sys.exit(1)
-    if not _ManifestHandler.code:
+    if not server.callback_code:  # type: ignore[attr-defined]
         print("\nERROR: Timed out waiting for GitHub redirect", file=sys.stderr)
         sys.exit(1)
 
-    code = _ManifestHandler.code
+    code = server.callback_code  # type: ignore[attr-defined]
     print(" ok")
 
     # Exchange code for credentials
@@ -315,8 +317,10 @@ def create_app(root: Path) -> dict:
                         break
                 if installation_id:
                     break
-        except Exception:
-            pass  # Retry on transient errors
+        except Exception as exc:
+            print(f"\n  (poll error, will retry: {exc})", file=sys.stderr, end="")
+            # Continue polling — transient auth / network errors are expected
+            # while the PEM is fresh and installation is in progress.
 
     if not installation_id:
         print("\nERROR: Timed out waiting for app installation.", file=sys.stderr)

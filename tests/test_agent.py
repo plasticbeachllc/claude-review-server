@@ -17,12 +17,17 @@ import pytest
 # Set required env vars before importing agent (module-level checks)
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret-key")
 
-# GitHub App env vars — agent validates these at import time
+# GitHub App env vars — agent validates these at import time.
+# Use a persistent temp dir that is cleaned up via atexit.
 _test_pem_dir = tempfile.mkdtemp()
 _test_pem_file = os.path.join(_test_pem_dir, "test-key.pem")
 if not os.path.exists(_test_pem_file):
     with open(_test_pem_file, "w") as f:
         f.write("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+
+import atexit, shutil  # noqa: E402
+atexit.register(shutil.rmtree, _test_pem_dir, ignore_errors=True)
+
 os.environ.setdefault("GH_APP_ID", "12345")
 os.environ.setdefault("GH_INSTALLATION_ID", "67890")
 os.environ.setdefault("GH_APP_PRIVATE_KEY_FILE", _test_pem_file)
