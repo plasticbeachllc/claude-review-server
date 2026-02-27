@@ -46,14 +46,21 @@ PEM_FILENAME = "github-app.pem"
 
 def _is_org(owner: str) -> bool:
     """Check whether a GitHub account is an organization (vs personal user)."""
-    resp = requests.get(
-        f"{GH_API}/users/{owner}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        timeout=15,
-    )
+    try:
+        resp = requests.get(
+            f"{GH_API}/users/{owner}",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as exc:
+        print(
+            f"ERROR: Could not reach GitHub API: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if resp.status_code != 200:
         print(
             f"ERROR: Could not look up account type for '{owner}' "
