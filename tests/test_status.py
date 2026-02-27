@@ -14,7 +14,7 @@ class TestStatusHealthCheck:
         server.id = 1
         server.status = status
         server.public_net.ipv4.ip = "1.2.3.4"
-        server.server_type.name = "cx11"
+        server.server_type.name = "cax11"
         server.datacenter.name = "fsn1-dc14"
         server.created.isoformat.return_value = "2025-01-01T00:00:00+00:00"
         return server

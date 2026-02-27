@@ -18,7 +18,7 @@ REQUIRED_KEYS = [
     "GH_APP_PRIVATE_KEY_FILE",
     "GH_INSTALLATION_ID",
     "GITHUB_WEBHOOK_SECRET",
-    "CLAUDE_CODE_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "CF_API_TOKEN",
     "CF_ACCOUNT_ID",
     "CF_ZONE_ID",
@@ -27,8 +27,8 @@ REQUIRED_KEYS = [
 ]
 DEFAULTS = {
     "SERVER_NAME": "pr-review",
-    "SERVER_TYPE": "cx11",
-    "SERVER_LOCATION": "fsn1",
+    "SERVER_TYPE": "cax11",
+    "SERVER_LOCATION": "nbg1",
     "SERVER_IMAGE": "ubuntu-24.04",
 }
 

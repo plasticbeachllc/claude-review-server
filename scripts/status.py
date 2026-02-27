@@ -48,7 +48,7 @@ def main():
     print(f"Status:   {server.status}")
     print(f"IP:       {ip}")
     print(f"Type:     {server.server_type.name}")
-    print(f"Location: {server.datacenter.name}")
+    print(f"Location: {server.location.name}")
     print(f"Created:  {server.created.isoformat()}")
 
     # Connection info (always shown regardless of SSH availability)

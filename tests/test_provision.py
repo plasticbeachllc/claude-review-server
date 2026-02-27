@@ -24,7 +24,7 @@ class TestLoadConfig:
             "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
             "GH_INSTALLATION_ID": "67890",
             "GITHUB_WEBHOOK_SECRET": "whsec_test",
-            "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test",
             "CF_API_TOKEN": "cf-test-token",
             "CF_ACCOUNT_ID": "cf-account-123",
             "CF_ZONE_ID": "cf-zone-456",
@@ -48,8 +48,8 @@ class TestLoadConfig:
         root = self._write_env(tmp_path, self._full_env())
         config = load_config(root)
         assert config["SERVER_NAME"] == "pr-review"
-        assert config["SERVER_TYPE"] == "cx11"
-        assert config["SERVER_LOCATION"] == "fsn1"
+        assert config["SERVER_TYPE"] == "cax11"
+        assert config["SERVER_LOCATION"] == "nbg1"
         assert config["SERVER_IMAGE"] == "ubuntu-24.04"
 
     def test_overrides_defaults(self, tmp_path):
@@ -746,7 +746,7 @@ class TestInjectAuth:
             "GH_INSTALLATION_ID": "67890",
             "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
             "GITHUB_WEBHOOK_SECRET": "whsec_test",
-            "CLAUDE_CODE_AUTH_TOKEN": "sk-ant-test",
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test",
         }
         if tmp_path:
             pem = tmp_path / "github-app.pem"
