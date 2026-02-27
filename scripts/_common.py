@@ -23,7 +23,7 @@ REQUIRED_KEYS = [
     "CF_ACCOUNT_ID",
     "CF_ZONE_ID",
     "TUNNEL_HOSTNAME",
-    "GITHUB_ORG",
+    "GITHUB_OWNER",
 ]
 DEFAULTS = {
     "SERVER_NAME": "pr-review",

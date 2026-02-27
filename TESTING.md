@@ -7,7 +7,7 @@ Run through these phases in order before public release. Each checkbox is a pass
 - [ ] `just`, `uv`, and `python3` (>=3.10) installed locally
 - [ ] Hetzner Cloud account with API token
 - [ ] Cloudflare account with: API token (Zone:DNS:Edit + Account:Cloudflare Tunnel:Edit), Account ID, Zone ID
-- [ ] GitHub org with admin access
+- [ ] GitHub account (org or personal) with admin access
 - [ ] Claude Code auth token (`claude setup-token`)
 - [ ] SSH key pair in `~/.ssh/`
 
@@ -41,7 +41,7 @@ Run through these phases in order before public release. Each checkbox is a pass
 
 ## Phase 4: End-to-End PR Review
 
-- [ ] Open a new PR on any repo in the configured GitHub org
+- [ ] Open a new PR on any repo where the app is installed
 - [ ] Check GitHub webhook Recent Deliveries — should show 200 response
 - [ ] Within 1–3 minutes, a review comment appears on the PR
 - [ ] Comment has `<!-- claude-review -->` marker (view raw source)
@@ -86,7 +86,7 @@ Run through these phases in order before public release. Each checkbox is a pass
 - [ ] `just destroy yes` — deletes webhook, DNS record, tunnel, server
 - [ ] Verify in Hetzner console: server gone
 - [ ] Verify in Cloudflare dashboard: tunnel gone, DNS record gone
-- [ ] Verify in GitHub org settings: webhook gone
+- [ ] Verify in GitHub account settings: webhook gone
 - [ ] `just status` — exits with code 3 (not found)
 
 ## Phase 11: Manual Setup Path (Optional)

@@ -29,7 +29,7 @@ class TestLoadConfig:
             "CF_ACCOUNT_ID": "cf-account-123",
             "CF_ZONE_ID": "cf-zone-456",
             "TUNNEL_HOSTNAME": "pr-review.example.com",
-            "GITHUB_ORG": "myorg",
+            "GITHUB_OWNER": "myorg",
         }
         defaults.update(overrides)
         return "\n".join(f"{k}={v}" for k, v in defaults.items())
@@ -40,7 +40,7 @@ class TestLoadConfig:
         root = self._write_env(tmp_path, self._full_env())
         config = load_config(root)
         assert config["HCLOUD_TOKEN"] == "hc-test-token"
-        assert config["GITHUB_ORG"] == "myorg"
+        assert config["GITHUB_OWNER"] == "myorg"
 
     def test_applies_defaults(self, tmp_path):
         from _common import load_config
@@ -378,7 +378,7 @@ class TestAutoCleanup:
     def test_auto_cleanup_calls_destroy_functions(self):
         from provision import _auto_cleanup
 
-        config = {"SERVER_NAME": "test", "GITHUB_ORG": "org", "TUNNEL_HOSTNAME": "h"}
+        config = {"SERVER_NAME": "test", "GITHUB_OWNER": "org", "TUNNEL_HOSTNAME": "h"}
         created = {"server": "test", "tunnel": "h", "dns": "h"}
 
         with patch("provision.delete_dns_record") as dd, \

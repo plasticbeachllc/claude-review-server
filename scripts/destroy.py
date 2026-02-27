@@ -135,7 +135,7 @@ def main():
         print("Completed with errors — the following may need manual cleanup:")
         for label, detail in errors:
             print(f"  • {label}: {detail}")
-        print(f"\nHint: check the Hetzner console, Cloudflare dashboard, and GitHub org settings.")
+        print(f"\nHint: check the Hetzner console, Cloudflare dashboard, and GitHub account settings.")
         sys.exit(1)
     else:
         print("All resources destroyed.")
