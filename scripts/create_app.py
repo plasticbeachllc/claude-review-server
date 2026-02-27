@@ -106,9 +106,11 @@ class _ManifestHandler(BaseHTTPRequestHandler):
             codes = params.get("code", [])
             if codes:
                 self.server.callback_code = codes[0]  # type: ignore[attr-defined]
+                self.server.callback_event.set()  # type: ignore[attr-defined]
                 self._respond(200, "App created! You can close this tab.")
             else:
                 self.server.callback_error = "No code in callback"  # type: ignore[attr-defined]
+                self.server.callback_event.set()  # type: ignore[attr-defined]
                 self._respond(400, "Error: no code parameter received.")
         else:
             self.send_response(404)
@@ -117,26 +119,26 @@ class _ManifestHandler(BaseHTTPRequestHandler):
     def _serve_form(self):
         """Serve an HTML page that auto-submits the manifest to GitHub."""
         server = self.server
-        manifest = json.dumps(server.manifest)  # type: ignore[attr-defined]
-        org = server.org  # type: ignore[attr-defined]
-        html = textwrap.dedent(f"""\
+        manifest_escaped = html.escape(json.dumps(server.manifest))  # type: ignore[attr-defined]
+        org_escaped = html.escape(server.org)  # type: ignore[attr-defined]
+        page = textwrap.dedent(f"""\
             <!DOCTYPE html>
             <html>
             <head><title>Create GitHub App</title></head>
             <body>
-            <h2>Creating GitHub App for {org}...</h2>
+            <h2>Creating GitHub App for {org_escaped}...</h2>
             <p>If you are not redirected automatically,
                click the button below.</p>
             <form id="manifest-form" method="post"
-                  action="https://github.com/organizations/{org}/settings/apps/new">
-              <input type="hidden" name="manifest" value="{html.escape(manifest)}">
+                  action="https://github.com/organizations/{org_escaped}/settings/apps/new">
+              <input type="hidden" name="manifest" value="{manifest_escaped}">
               <button type="submit">Create GitHub App</button>
             </form>
             <script>document.getElementById('manifest-form').submit();</script>
             </body>
             </html>
         """)
-        self._respond(200, html, content_type="text/html")
+        self._respond(200, page, content_type="text/html")
 
     def _respond(self, status: int, body: str, content_type: str = "text/html"):
         encoded = body.encode()
@@ -216,21 +218,19 @@ def create_app(root: Path) -> dict:
     # Store callback results on the server instance (read by main thread)
     server.callback_code = None  # type: ignore[attr-defined]
     server.callback_error = None  # type: ignore[attr-defined]
+    server.callback_event = threading.Event()  # type: ignore[attr-defined]
 
     # Serve in a background thread
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    webbrowser.open(f"http://localhost:{port}/")
+    url = f"http://localhost:{port}/"
+    if not webbrowser.open(url):
+        print(f"\n  No browser found. Open this URL manually:\n  {url}")
 
     # Wait for the callback (up to 5 minutes)
     print("  Waiting for you to approve the app on GitHub...", end="", flush=True)
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        if server.callback_code or server.callback_error:  # type: ignore[attr-defined]
-            break
-        print(".", end="", flush=True)
-        time.sleep(2)
+    server.callback_event.wait(timeout=300)  # type: ignore[attr-defined]
 
     server.shutdown()
 
@@ -276,7 +276,7 @@ def create_app(root: Path) -> dict:
     # Update .env
     _upsert_env(env_path, {
         "GH_APP_ID": app_id,
-        "GH_APP_PRIVATE_KEY_FILE": PEM_FILENAME,
+        "GH_APP_PRIVATE_KEY_FILE": str(pem_path.resolve()),
         "GITHUB_WEBHOOK_SECRET": webhook_secret,
     })
     print(f"  Updated .env: GH_APP_ID={app_id}")
@@ -288,7 +288,8 @@ def create_app(root: Path) -> dict:
     print(f"  Opening: {install_url}")
     print(f"  Select your org '{org}' and click Install.")
     print()
-    webbrowser.open(install_url)
+    if not webbrowser.open(install_url):
+        print(f"\n  No browser found. Open this URL manually:\n  {install_url}")
 
     # Poll for the installation
     print("  Waiting for installation...", end="", flush=True)

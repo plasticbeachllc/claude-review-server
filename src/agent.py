@@ -93,12 +93,17 @@ def _generate_jwt(app_id: str, private_key_path: str) -> str:
 
     signing_input = f"{header}.{payload}"
 
-    result = subprocess.run(
-        ["openssl", "dgst", "-sha256", "-sign", private_key_path],
-        input=signing_input.encode(),
-        capture_output=True,
-        timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", private_key_path],
+            input=signing_input.encode(),
+            capture_output=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "openssl not found — install it (e.g. apt install openssl)"
+        ) from None
     if result.returncode != 0:
         raise RuntimeError(
             f"openssl signing failed (rc={result.returncode}): "

@@ -205,7 +205,8 @@ def _upsert_env_var(ip: str, key: str, value: str, *, label: str = ""):
     because all callers pass hard-coded key names (``GH_APP_ID`` etc.), never
     user-supplied input.  Do not expose this as a general-purpose API.
     """
-    assert re.match(r"^[A-Z_][A-Z0-9_]*$", key), f"Unsafe env key: {key!r}"
+    if not re.match(r"^[A-Z_][A-Z0-9_]*$", key):
+        raise ValueError(f"Unsafe env key: {key!r}")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
          f"VALUE=$(cat) && "
