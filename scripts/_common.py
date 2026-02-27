@@ -15,7 +15,10 @@ GH_API = "https://api.github.com"
 
 REQUIRED_KEYS = [
     "HCLOUD_TOKEN",
-    "GH_TOKEN",
+    "GH_APP_ID",
+    "GH_APP_PRIVATE_KEY_FILE",
+    "GH_INSTALLATION_ID",
+    "GITHUB_WEBHOOK_SECRET",
     "CLAUDE_CODE_AUTH_TOKEN",
     "CF_API_TOKEN",
     "CF_ACCOUNT_ID",

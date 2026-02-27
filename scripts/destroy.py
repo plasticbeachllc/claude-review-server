@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Destroy a provisioned PR review server and clean up associated resources.
 
-Removes (in reverse order): GitHub webhook, DNS record, Cloudflare Tunnel,
-Hetzner server. Each step is best-effort — failures are warned but don't
-block cleanup of remaining resources.
+Removes (in reverse order): DNS record, Cloudflare Tunnel, Hetzner server.
+The GitHub App and its webhook are preserved so ``just provision`` can be
+re-run without ``just create-app``.  Each step is best-effort — failures
+are warned but don't block cleanup of remaining resources.
 
 Usage:
     python3 scripts/destroy.py
@@ -13,50 +14,10 @@ Usage:
 import sys
 from pathlib import Path
 
-import requests
 from hcloud import Client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import GH_API, ProvisionError, cf_request, gh_paginate, load_config  # noqa: E402
-
-
-def delete_webhook(config: dict):
-    """Find and delete the GitHub org webhook matching our tunnel hostname."""
-    org = config["GITHUB_ORG"]
-    hostname = config["TUNNEL_HOSTNAME"]
-    target_url = f"https://{hostname}/webhook"
-    headers = {
-        "Authorization": f"Bearer {config['GH_TOKEN']}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    # List all hooks (follows pagination automatically)
-    hooks = gh_paginate(
-        f"{GH_API}/orgs/{org}/hooks",
-        headers=headers, params={"per_page": 100},
-    )
-
-    matching = [h for h in hooks if h.get("config", {}).get("url", "") == target_url]
-    if not matching:
-        print("  No matching webhook found (already deleted?)")
-        return
-
-    if len(matching) > 1:
-        print(f"  Warning: found {len(matching)} webhooks for {target_url}, deleting all")
-    for hook in matching:
-        del_resp = requests.delete(
-            f"{GH_API}/orgs/{org}/hooks/{hook['id']}",
-            headers=headers, timeout=30,
-        )
-        if del_resp.status_code == 204:
-            print(f"  Deleted webhook {hook['id']}")
-        elif del_resp.status_code == 404:
-            print(f"  Webhook {hook['id']} already deleted (404)")
-        else:
-            raise ProvisionError(
-                f"Webhook delete failed ({del_resp.status_code}): {del_resp.text}"
-            )
+from _common import ProvisionError, cf_request, load_config  # noqa: E402
 
 
 def delete_dns_record(config: dict):
@@ -156,7 +117,6 @@ def main():
     print(f"Destroying '{name}' and associated resources...\n")
 
     steps = [
-        ("GitHub webhook", delete_webhook),
         ("DNS record", delete_dns_record),
         ("Cloudflare Tunnel", delete_tunnel),
         ("Hetzner server", delete_server),

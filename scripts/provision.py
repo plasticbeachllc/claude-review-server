@@ -2,8 +2,11 @@
 """Provision a Hetzner server with the PR review agent — fully automated.
 
 Reads configuration from .env, creates a server via the Hetzner API,
-waits for cloud-init, injects auth tokens, sets up a Cloudflare Tunnel,
-creates a GitHub org webhook, and starts the service.
+waits for cloud-init, injects GitHub App credentials and Claude auth,
+sets up a Cloudflare Tunnel, and starts the service.
+
+Requires ``just create-app`` to have been run first (GitHub App + webhook
+are configured there).
 
 Usage:
     python3 scripts/provision.py          # provision from .env
@@ -11,6 +14,7 @@ Usage:
 """
 
 import base64
+import re
 import secrets
 import subprocess
 import sys
@@ -34,7 +38,6 @@ from _common import (  # noqa: E402
     SSH_OPTS,
     ProvisionError,
     cf_request,
-    gh_paginate,
     load_config,
     ssh,
     wait_for_cloud_init,
@@ -45,7 +48,6 @@ from destroy import (  # noqa: E402
     delete_dns_record,
     delete_server,
     delete_tunnel,
-    delete_webhook,
 )
 
 
@@ -194,10 +196,42 @@ def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str
 # ---------------------------------------------------------------------------
 # Auth injection
 # ---------------------------------------------------------------------------
-def inject_auth(ip: str, config: dict):
-    """Inject GitHub and Claude auth tokens into the server.
+def _upsert_env_var(ip: str, key: str, value: str, *, label: str = ""):
+    """Upsert a single key=value into the server's /opt/pr-review/.env.
 
-    Uses upsert logic so re-running is safe (no duplicate tokens).
+    Value is piped via stdin to avoid exposing it in process args.
+
+    NOTE: ``key`` is interpolated into the remote shell command.  This is safe
+    because all callers pass hard-coded key names (``GH_APP_ID`` etc.), never
+    user-supplied input.  Do not expose this as a general-purpose API.
+    """
+    if not re.match(r"^[A-Z_][A-Z0-9_]*$", key):
+        raise ValueError(f"Unsafe env key: {key!r}")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"root@{ip}",
+         f"VALUE=$(cat) && "
+         f"TMPFILE=$(mktemp -p /opt/pr-review/) && "
+         f"{{ grep -v '^{key}=' /opt/pr-review/.env || true; }} > \"$TMPFILE\" && "
+         f"chmod 600 \"$TMPFILE\" && "
+         f"mv \"$TMPFILE\" /opt/pr-review/.env && "
+         f"printf '{key}=%s\\n' \"${{VALUE}}\" >> /opt/pr-review/.env && "
+         f"grep -q '^{key}=' /opt/pr-review/.env"],
+        input=value, capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        display = label or key
+        raise ProvisionError(
+            f"Env var injection failed for {display} (rc={result.returncode})\n"
+            f"stderr: {result.stderr.strip()}"
+        )
+
+
+def inject_auth(ip: str, config: dict):
+    """Inject GitHub App credentials and Claude auth tokens into the server.
+
+    Copies the App private key PEM and upserts env vars into the service
+    env file.  Uses stdin for all secret values to avoid process-arg exposure.
+    Re-running is safe (upsert logic).
     """
     # Preflight: verify gh CLI is installed (cloud-init may not have finished)
     try:
@@ -208,42 +242,40 @@ def inject_auth(ip: str, config: dict):
             f"Check cloud-init logs: ssh root@{ip} cloud-init status --long"
         )
 
-    # GitHub CLI auth — pipe token via stdin to avoid exposing it in process args
-    print("  Authenticating GitHub CLI...")
+    # Copy GitHub App private key to the server
+    print("  Injecting GitHub App private key...")
+    pem_path = Path(config["GH_APP_PRIVATE_KEY_FILE"])
+    if not pem_path.is_file():
+        raise ProvisionError(f"Private key not found: {pem_path}")
+    pem_content = pem_path.read_text()
+
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
-         "sudo -u review gh auth login --with-token"],
-        input=config["GH_TOKEN"], capture_output=True, text=True, timeout=30,
+         "cat > /opt/pr-review/github-app.pem && "
+         "chmod 600 /opt/pr-review/github-app.pem && "
+         "chown review:review /opt/pr-review/github-app.pem"],
+        input=pem_content, capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
         raise ProvisionError(
-            f"GitHub CLI auth failed (rc={result.returncode})\n"
+            f"PEM injection failed (rc={result.returncode})\n"
             f"stderr: {result.stderr.strip()}"
         )
 
+    # Inject GitHub App env vars
+    print("  Injecting GitHub App configuration...")
+    _upsert_env_var(ip, "GH_APP_ID", config["GH_APP_ID"])
+    _upsert_env_var(ip, "GH_INSTALLATION_ID", config["GH_INSTALLATION_ID"])
+    _upsert_env_var(ip, "GH_APP_PRIVATE_KEY_FILE", "/opt/pr-review/github-app.pem")
+    _upsert_env_var(ip, "GITHUB_WEBHOOK_SECRET", config["GITHUB_WEBHOOK_SECRET"],
+                    label="GITHUB_WEBHOOK_SECRET")
+
     # Claude Code auth — upsert token in the service env file.
-    # Strategy: remove any existing line, then append the new one.
     # Token is piped via stdin into a shell variable so it never appears in
-    # process args (/proc/*/cmdline).  grep -v + mv avoids sed metacharacter
-    # issues (|, &, \ in the token would silently corrupt a sed replacement).
+    # process args (/proc/*/cmdline).
     print("  Injecting Claude Code auth token...")
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"root@{ip}",
-         "TOKEN=$(cat) && "
-         "TMPFILE=$(mktemp -p /opt/pr-review/) && "
-         "{ grep -v '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env || true; } > \"$TMPFILE\" && "
-         "chmod 600 \"$TMPFILE\" && "
-         "mv \"$TMPFILE\" /opt/pr-review/.env && "
-         "printf 'CLAUDE_CODE_AUTH_TOKEN=%s\\n' \"${TOKEN}\" >> /opt/pr-review/.env && "
-         "grep -q '^CLAUDE_CODE_AUTH_TOKEN=' /opt/pr-review/.env"],
-        input=config["CLAUDE_CODE_AUTH_TOKEN"],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise ProvisionError(
-            f"Claude Code auth injection failed (rc={result.returncode})\n"
-            f"stderr: {result.stderr.strip()}"
-        )
+    _upsert_env_var(ip, "CLAUDE_CODE_AUTH_TOKEN", config["CLAUDE_CODE_AUTH_TOKEN"],
+                    label="CLAUDE_CODE_AUTH_TOKEN")
 
 
 # ---------------------------------------------------------------------------
@@ -369,80 +401,14 @@ def setup_tunnel(config: dict, server_ip: str, created: dict | None = None) -> s
     return hostname
 
 
-# ---------------------------------------------------------------------------
-# GitHub webhook
-# ---------------------------------------------------------------------------
-def read_webhook_secret(ip: str) -> str:
-    """Read the auto-generated GITHUB_WEBHOOK_SECRET from the server.
-
-    The secret is generated by cloud-init (``openssl rand -hex 32``) and
-    stored bare in ``.env`` — no inline comments or quoting — so the
-    simple ``grep | cut`` approach is reliable here.
-    """
-    raw = ssh(ip, "grep ^GITHUB_WEBHOOK_SECRET /opt/pr-review/.env | cut -d= -f2-",
-              label="read GITHUB_WEBHOOK_SECRET")
-    if not raw:
-        raise ProvisionError("Could not read GITHUB_WEBHOOK_SECRET from server")
-    return raw
-
-
-def create_webhook(config: dict, webhook_secret: str, tunnel_hostname: str):
-    """Create a GitHub org-level webhook.
-
-    If a webhook with the same URL already exists, skips creation.
-    """
-    org = config["GITHUB_ORG"]
-    url = f"https://{tunnel_hostname}/webhook"
-    headers = {
-        "Authorization": f"Bearer {config['GH_TOKEN']}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    # List all webhooks (follows pagination automatically).
-    hooks = gh_paginate(
-        f"{GH_API}/orgs/{org}/hooks",
-        headers=headers, params={"per_page": 100},
-    )
-    for hook in hooks:
-        if hook.get("config", {}).get("url") == url:
-            print(f"  Webhook already exists (id={hook['id']}), skipping creation")
-            return
-
-    print(f"  Creating GitHub webhook for {org} -> {url}")
-    resp = requests.post(
-        f"{GH_API}/orgs/{org}/hooks",
-        headers=headers,
-        json={
-            "name": "web",
-            "config": {
-                "url": url,
-                "content_type": "json",
-                "secret": webhook_secret,
-            },
-            "events": ["pull_request"],
-            "active": True,
-        },
-        timeout=30,
-    )
-    if resp.status_code not in (201, 200):
-        raise ProvisionError(
-            f"GitHub webhook creation failed ({resp.status_code}): {resp.text}"
-        )
-    hook_id = resp.json().get("id")
-    print(f"  Webhook created: id={hook_id}")
-
-
 def _auto_cleanup(created: dict, config: dict):
     """Best-effort cleanup of partially created resources on failure."""
     if not created:
         return
     print("\nCleaning up partially created resources...", file=sys.stderr)
 
-    # Reverse order: webhook -> DNS -> tunnel -> server -> SSH key
+    # Reverse order: DNS -> tunnel -> server -> SSH key
     cleanup_steps = []
-    if "webhook" in created:
-        cleanup_steps.append(("webhook", delete_webhook))
     if "dns" in created:
         cleanup_steps.append(("DNS record", delete_dns_record))
     if "tunnel" in created:
@@ -514,11 +480,8 @@ def main():
         print("[7/8] Setting up Cloudflare Tunnel...")
         hostname = setup_tunnel(config, ip, created=created)
 
-        # 8. GitHub webhook + start service
-        print("[8/8] Creating webhook and starting service...")
-        webhook_secret = read_webhook_secret(ip)
-        create_webhook(config, webhook_secret, hostname)
-        created["webhook"] = hostname
+        # 8. Start service (webhook is configured by `just create-app`)
+        print("[8/8] Starting service...")
         ssh(ip, "systemctl restart pr-review")
 
         # Verify the service actually started (retry to allow systemd to settle)

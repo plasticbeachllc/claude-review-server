@@ -1,5 +1,9 @@
 # PR Review Agent — build & deploy commands
 
+# Create and install a GitHub App (one-time setup, run before first provision)
+create-app:
+    uv run python scripts/create_app.py
+
 # Build cloud-init.yaml from template + source files
 build:
     python3 scripts/build.py
@@ -34,7 +38,7 @@ setup-tls host cert key:
 provision:
     uv run python scripts/provision.py
 
-# Destroy the server and clean up tunnel/webhook/DNS (pass "yes" to confirm)
+# Destroy the server and clean up tunnel/DNS (pass "yes" to confirm)
 destroy confirm="":
     @[ "{{ confirm }}" = "yes" ] || (echo "This will delete the server and all associated resources."; echo "Run: just destroy yes"; exit 1)
     uv run python scripts/destroy.py --yes

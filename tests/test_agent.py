@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import subprocess
+import tempfile
 import textwrap
 import threading
 from http.server import HTTPServer
@@ -13,20 +14,41 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Set required env var before importing agent
+# Set required env vars before importing agent (module-level checks)
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret-key")
+
+# GitHub App env vars — agent validates these at import time.
+# Use a persistent temp dir that is cleaned up via atexit.
+_test_pem_dir = tempfile.mkdtemp()
+_test_pem_file = os.path.join(_test_pem_dir, "test-key.pem")
+if not os.path.exists(_test_pem_file):
+    with open(_test_pem_file, "w") as f:
+        f.write("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+
+import atexit, shutil  # noqa: E402
+atexit.register(shutil.rmtree, _test_pem_dir, ignore_errors=True)
+
+os.environ.setdefault("GH_APP_ID", "12345")
+os.environ.setdefault("GH_INSTALLATION_ID", "67890")
+os.environ.setdefault("GH_APP_PRIVATE_KEY_FILE", _test_pem_file)
 
 from agent import (
     DEBOUNCE_SECONDS,
     REVIEW_MARKER,
     WebhookHandler,
+    _b64url,
     _bump_generation,
+    _generate_jwt,
+    _get_installation_token,
+    _gh_env,
     _is_current,
     _PRReviewState,
     _review_state,
     _review_state_lock,
     _schedule_review,
     _shutting_down,
+    _token_cache,
+    _token_lock,
     already_reviewed,
     collapse_old_reviews,
     extract_diff_filenames,
@@ -37,6 +59,90 @@ from agent import (
     smart_truncate_diff,
     verify_signature,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_gh_env(monkeypatch):
+    """Prevent real JWT generation / token exchange in all tests.
+
+    Tests that specifically test _gh_env or _get_installation_token
+    override this with their own patches.
+    """
+    monkeypatch.setattr(
+        "agent._gh_env",
+        lambda: {**os.environ, "GH_TOKEN": "ghs_test_installation_token"},
+    )
+
+
+# ── JWT generation ──────────────────────────────────────
+
+
+class TestJWTGeneration:
+    def test_b64url_no_padding(self):
+        result = _b64url(b"test data")
+        assert "=" not in result
+
+    def test_generate_jwt_structure(self, rsa_key_pair):
+        jwt = _generate_jwt("12345", str(rsa_key_pair))
+        parts = jwt.split(".")
+        assert len(parts) == 3  # header.payload.signature
+
+    def test_generate_jwt_with_bad_key_raises(self, tmp_path):
+        bad_key = tmp_path / "bad.pem"
+        bad_key.write_text("not a real key")
+        with pytest.raises(RuntimeError, match="openssl signing failed"):
+            _generate_jwt("12345", str(bad_key))
+
+
+class TestInstallationToken:
+    def test_gh_env_contains_gh_token(self):
+        """_gh_env() should return an env dict with GH_TOKEN set."""
+        # Mock _get_installation_token to avoid real API calls
+        with patch("agent._get_installation_token", return_value="ghs_test_token"):
+            env = _gh_env()
+        assert env["GH_TOKEN"] == "ghs_test_token"
+
+    def test_token_cache_reuses_valid_token(self):
+        """Cached tokens should be reused when not near expiry."""
+        import time as _time
+
+        with _token_lock:
+            _token_cache.token = "cached_token"
+            _token_cache.expires_at = _time.time() + 3600  # 1 hour from now
+
+        try:
+            token = _get_installation_token()
+            assert token == "cached_token"
+        finally:
+            with _token_lock:
+                _token_cache.token = ""
+                _token_cache.expires_at = 0.0
+
+    def test_token_cache_refreshes_near_expiry(self):
+        """Tokens near expiry should trigger a refresh."""
+        import time as _time
+
+        with _token_lock:
+            _token_cache.token = "old_token"
+            _token_cache.expires_at = _time.time() + 60  # only 1 min left (< 5 min buffer)
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "token": "new_token",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        try:
+            with patch("agent._generate_jwt", return_value="fake.jwt.token"), \
+                 patch("agent.urllib.request.urlopen", return_value=mock_resp):
+                token = _get_installation_token()
+            assert token == "new_token"
+        finally:
+            with _token_lock:
+                _token_cache.token = ""
+                _token_cache.expires_at = 0.0
 
 
 # ── verify_signature ─────────────────────────────────────
