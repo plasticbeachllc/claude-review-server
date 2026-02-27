@@ -497,7 +497,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if length > 5_000_000:  # 5 MB sanity limit
             log.warning(f"Payload too large ({length} bytes) from {self.client_address[0]}")
             self.send_response(413)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
+            self.wfile.write(b'{"error":"payload too large"}')
             return
 
         payload = self.rfile.read(length)
@@ -506,7 +508,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if not verify_signature(payload, signature):
             log.warning(f"Invalid signature from {self.client_address[0]}")
             self.send_response(403)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
+            self.wfile.write(b'{"error":"invalid signature"}')
             return
 
         self.send_response(200)
