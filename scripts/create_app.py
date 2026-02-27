@@ -94,6 +94,9 @@ def _read_env(path: Path) -> dict[str, str]:
 def _upsert_env(path: Path, updates: dict[str, str]):
     """Add or update keys in a .env file, preserving comments and order.
 
+    Preserves ``export`` prefixes on lines that already have them, so that
+    shell-compatible .env files keep working when sourced.
+
     Uses atomic write (temp file + rename) to avoid partial writes if
     the process is interrupted mid-write.
     """
@@ -104,9 +107,15 @@ def _upsert_env(path: Path, updates: dict[str, str]):
         for line in path.read_text().splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#") and "=" in stripped:
-                key = stripped.partition("=")[0].strip()
+                raw_key = stripped.partition("=")[0].strip()
+                # Detect and preserve "export" prefix
+                prefix = ""
+                key = raw_key
+                if raw_key.startswith("export "):
+                    prefix = "export "
+                    key = raw_key[len("export "):].strip()
                 if key in updates:
-                    lines.append(f"{key}={updates[key]}")
+                    lines.append(f"{prefix}{key}={updates[key]}")
                     existing_keys.add(key)
                     continue
             lines.append(line)
@@ -124,13 +133,30 @@ def _upsert_env(path: Path, updates: dict[str, str]):
 # ---------------------------------------------------------------------------
 # Manifest flow HTTP handler
 # ---------------------------------------------------------------------------
+class _ManifestServer(HTTPServer):
+    """HTTPServer subclass that holds manifest-flow state as typed attributes.
+
+    This avoids ad-hoc attribute injection (``type: ignore[attr-defined]``)
+    on a plain ``HTTPServer`` and makes the interface explicit.
+    """
+
+    manifest: dict
+    owner: str
+    is_org: bool
+    expected_state: str
+    callback_code: str | None
+    callback_error: str | None
+    callback_event: threading.Event
+
+
 class _ManifestHandler(BaseHTTPRequestHandler):
     """Handles the GitHub App manifest creation redirect flow.
 
-    Results are stored on the *server* instance (not class variables) so
-    that the main thread can read them without relying on class-level
-    mutation from the server thread.
+    Results are stored on the ``_ManifestServer`` instance so that the
+    main thread can read them after the callback fires.
     """
+
+    server: _ManifestServer  # narrow the type from BaseServer
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -141,21 +167,20 @@ class _ManifestHandler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/callback/"):
             # GitHub redirects here: /callback/{state}?code=...
             path_state = parsed.path.removeprefix("/callback/")
-            expected = getattr(self.server, "expected_state", None)
-            if expected and path_state != expected:
-                self.server.callback_error = "Invalid state parameter"  # type: ignore[attr-defined]
-                self.server.callback_event.set()  # type: ignore[attr-defined]
+            if self.server.expected_state and path_state != self.server.expected_state:
+                self.server.callback_error = "Invalid state parameter"
+                self.server.callback_event.set()
                 self._respond(400, "Error: invalid state parameter.")
                 return
             params = parse_qs(parsed.query)
             codes = params.get("code", [])
             if codes:
-                self.server.callback_code = codes[0]  # type: ignore[attr-defined]
-                self.server.callback_event.set()  # type: ignore[attr-defined]
+                self.server.callback_code = codes[0]
+                self.server.callback_event.set()
                 self._respond(200, "App created! You can close this tab.")
             else:
-                self.server.callback_error = "No code in callback"  # type: ignore[attr-defined]
-                self.server.callback_event.set()  # type: ignore[attr-defined]
+                self.server.callback_error = "No code in callback"
+                self.server.callback_event.set()
                 self._respond(400, "Error: no code parameter received.")
         else:
             self.send_response(404)
@@ -163,10 +188,9 @@ class _ManifestHandler(BaseHTTPRequestHandler):
 
     def _serve_form(self):
         """Serve an HTML page that auto-submits the manifest to GitHub."""
-        server = self.server
-        manifest_escaped = html.escape(json.dumps(server.manifest))  # type: ignore[attr-defined]
-        owner_escaped = html.escape(server.owner)  # type: ignore[attr-defined]
-        if server.is_org:  # type: ignore[attr-defined]
+        manifest_escaped = html.escape(json.dumps(self.server.manifest))
+        owner_escaped = html.escape(self.server.owner)
+        if self.server.is_org:
             action_url = f"https://github.com/organizations/{owner_escaped}/settings/apps/new"
         else:
             action_url = "https://github.com/settings/apps/new"
@@ -201,11 +225,16 @@ class _ManifestHandler(BaseHTTPRequestHandler):
         pass  # Suppress default stderr logging
 
 
-def _find_free_port() -> int:
-    """Find an available TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _bind_free_port() -> socket.socket:
+    """Bind a socket to a free port on localhost and return it.
+
+    The socket is kept open so the port cannot be grabbed by another
+    process before ``HTTPServer`` starts using it (avoids a TOCTOU race).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    return sock
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +264,8 @@ def create_app(root: Path) -> dict:
         )
         sys.exit(1)
 
-    port = _find_free_port()
+    sock = _bind_free_port()
+    port = sock.getsockname()[1]
     state = secrets.token_hex(16)
     webhook_url = f"https://{hostname}/webhook"
 
@@ -269,12 +299,13 @@ def create_app(root: Path) -> dict:
         "public": False,
     }
 
-    # Start local server
-    server = HTTPServer(("127.0.0.1", port), _ManifestHandler)
-    server.manifest = manifest  # type: ignore[attr-defined]
-    server.owner = owner  # type: ignore[attr-defined]
-    server.is_org = is_org  # type: ignore[attr-defined]
-    server.expected_state = state  # type: ignore[attr-defined]
+    # Start local server — reuse the already-bound socket to avoid TOCTOU race
+    server = _ManifestServer(("127.0.0.1", port), _ManifestHandler)
+    server.socket = sock
+    server.manifest = manifest
+    server.owner = owner
+    server.is_org = is_org
+    server.expected_state = state
 
     print(f"[1/4] Starting local server on http://localhost:{port}")
     print(f"  Opening browser to create GitHub App for {account_label} '{owner}'...")
@@ -282,9 +313,9 @@ def create_app(root: Path) -> dict:
     print()
 
     # Store callback results on the server instance (read by main thread)
-    server.callback_code = None  # type: ignore[attr-defined]
-    server.callback_error = None  # type: ignore[attr-defined]
-    server.callback_event = threading.Event()  # type: ignore[attr-defined]
+    server.callback_code = None
+    server.callback_error = None
+    server.callback_event = threading.Event()
 
     # Serve in a background thread
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -296,18 +327,18 @@ def create_app(root: Path) -> dict:
 
     # Wait for the callback (up to 5 minutes)
     print("  Waiting for you to approve the app on GitHub...", end="", flush=True)
-    server.callback_event.wait(timeout=300)  # type: ignore[attr-defined]
+    server.callback_event.wait(timeout=300)
 
     server.shutdown()
 
-    if server.callback_error:  # type: ignore[attr-defined]
+    if server.callback_error:
         print(f"\nERROR: {server.callback_error}", file=sys.stderr)
         sys.exit(1)
-    if not server.callback_code:  # type: ignore[attr-defined]
+    if not server.callback_code:
         print("\nERROR: Timed out waiting for GitHub redirect", file=sys.stderr)
         sys.exit(1)
 
-    code = server.callback_code  # type: ignore[attr-defined]
+    code = server.callback_code
     print(" ok")
 
     # Exchange code for credentials

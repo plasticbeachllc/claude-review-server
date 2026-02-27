@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import subprocess
 import time
 
@@ -21,6 +22,9 @@ def generate_jwt(app_id: str, private_key_path: str) -> str:
     The JWT is valid for 10 minutes (the GitHub maximum) with 60 seconds
     of backward clock-skew tolerance on the ``iat`` claim.
     """
+    if not os.path.isfile(private_key_path):
+        raise RuntimeError(f"Private key not found: {private_key_path}")
+
     now = int(time.time())
     header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     payload = _b64url(json.dumps({
@@ -46,6 +50,11 @@ def generate_jwt(app_id: str, private_key_path: str) -> str:
         raise RuntimeError(
             f"openssl signing failed (rc={result.returncode}): "
             f"{result.stderr.decode().strip()}"
+        )
+
+    if not result.stdout:
+        raise RuntimeError(
+            "openssl produced no output — check key file permissions"
         )
 
     signature = _b64url(result.stdout)

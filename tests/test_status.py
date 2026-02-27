@@ -145,7 +145,7 @@ class TestStatusHealthCheck:
 
         mock_ssh.side_effect = [
             "active",
-            "unreachable",  # curl failed
+            '{"status":"unreachable"}',  # curl failed — returns JSON with non-healthy status
         ]
         mock_requests_get.return_value = MagicMock(status_code=200)
 

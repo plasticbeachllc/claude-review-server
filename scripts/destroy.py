@@ -96,7 +96,7 @@ def main():
     skip_confirm = "--yes" in sys.argv
 
     try:
-        config = load_config(root)
+        config = load_config(root, required_keys=["HCLOUD_TOKEN"])
     except ProvisionError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)

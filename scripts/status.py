@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -70,7 +71,7 @@ def main():
         print(f"Service:  {svc}")
         if svc != "active":
             healthy = False
-    except Exception:
+    except (ProvisionError, subprocess.TimeoutExpired, OSError):
         print("Service:  (SSH unreachable)")
         healthy = False
 
@@ -85,7 +86,7 @@ def main():
         print(f"Health:   {'healthy' if health_ok else f'(unhealthy: {health.strip()})'}")
         if not health_ok:
             healthy = False
-    except Exception:
+    except (ProvisionError, subprocess.TimeoutExpired, OSError):
         print("Health:   (check failed)")
         healthy = False
 

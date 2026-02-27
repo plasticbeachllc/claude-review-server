@@ -2,8 +2,8 @@
 # ─────────────────────────────────────────────────────────────────
 # PR Review Agent — Hetzner cloud-init
 #
-# GENERATED FILE — do not edit directly.
-# Edit the source files and run: just build
+# Source template — edit this file, then run: just build
+# The generated output (cloud-init.yaml) is gitignored.
 #
 # POST-PROVISION STEPS (do these manually after first boot):
 #   1. Set up a Cloudflare Tunnel pointing to http://localhost:80
@@ -111,7 +111,13 @@ runcmd:
   - apt-get update && apt-get install -y gh
 
   # ── Install Caddy ─────────────────────────────────────────
-  - bash -o pipefail -c 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg'
+  # GPG key hash pinned (same rationale as NodeSource and GitHub CLI above).
+  - |
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o /tmp/caddy-stable.gpg.key
+    echo "783dfee04b19e851a928cd87b34710213ebbe7628f98d9f34595ab83be578c00  /tmp/caddy-stable.gpg.key" | sha256sum -c - \
+      || { echo "FATAL: Caddy GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
+    gpg --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg /tmp/caddy-stable.gpg.key
+    rm /tmp/caddy-stable.gpg.key
   - bash -o pipefail -c 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list'
   - chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   - chmod o+r /etc/apt/sources.list.d/caddy-stable.list
