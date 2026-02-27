@@ -21,6 +21,7 @@ Usage:
 
 import html
 import json
+import secrets
 import socket
 import sys
 import textwrap
@@ -189,10 +190,16 @@ def create_app(root: Path) -> dict:
     port = _find_free_port()
     webhook_url = f"https://{hostname}/webhook"
 
+    # Random suffix avoids name collisions if re-creating the app.
+    # GitHub App names must be globally unique.
+    suffix = secrets.token_hex(3)
     manifest = {
-        "name": f"pr-review-{org}",
+        "name": f"pr-review-{org}-{suffix}",
         "url": "https://github.com/plasticbeachllc/claude-review-server",
         "hook_attributes": {
+            # No "secret" key here — GitHub generates the webhook secret
+            # automatically during the manifest flow and returns it in the
+            # POST /app-manifests/{code}/conversions response.
             "url": webhook_url,
             "active": True,
         },
@@ -262,10 +269,18 @@ def create_app(root: Path) -> dict:
         sys.exit(1)
 
     data = resp.json()
-    app_id = str(data["id"])
-    app_slug = data.get("slug", f"pr-review-{org}")
-    pem = data["pem"]
-    webhook_secret = data["webhook_secret"]
+    try:
+        app_id = str(data["id"])
+        app_slug = data.get("slug", f"pr-review-{org}")
+        pem = data["pem"]
+        webhook_secret = data["webhook_secret"]
+    except KeyError as e:
+        print(
+            f"ERROR: Unexpected response from GitHub (missing {e}): "
+            f"{json.dumps(data)[:500]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Save PEM file
     pem_path = root / PEM_FILENAME

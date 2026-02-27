@@ -127,50 +127,60 @@ def _get_installation_token() -> str:
     """Get a valid GitHub App installation token, refreshing if needed.
 
     Tokens are cached and refreshed when within 5 minutes of expiry.
-    Thread-safe via _token_lock.
+    Uses double-checked locking so the HTTP exchange runs outside the
+    lock — concurrent callers don't stall waiting for the network.
     """
+    # Fast path: return cached token if still valid.
     with _token_lock:
         if _token_cache.token and time.time() < (_token_cache.expires_at - 300):
             return _token_cache.token
 
-        jwt = _generate_jwt(GH_APP_ID, GH_APP_PRIVATE_KEY_FILE)
+    # Slow path: generate JWT and exchange for installation token.
+    # Runs outside _token_lock so other threads aren't blocked on I/O.
+    jwt = _generate_jwt(GH_APP_ID, GH_APP_PRIVATE_KEY_FILE)
 
-        # Exchange JWT for installation token via urllib (stdlib — no gh CLI needed
-        # since we don't have a token yet to authenticate gh with).
-        req = urllib.request.Request(
-            f"https://api.github.com/app/installations/"
-            f"{GH_INSTALLATION_ID}/access_tokens",
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {jwt}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            raise RuntimeError(
-                f"GitHub token exchange failed ({e.code}): {body}"
-            ) from e
+    # Exchange JWT for installation token via urllib (stdlib — no gh CLI needed
+    # since we don't have a token yet to authenticate gh with).
+    req = urllib.request.Request(
+        f"https://api.github.com/app/installations/"
+        f"{GH_INSTALLATION_ID}/access_tokens",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(
+            f"GitHub token exchange failed ({e.code}): {body}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"GitHub token exchange failed (network): {e.reason}"
+        ) from e
 
-        try:
-            _token_cache.token = data["token"]
-            expires_str = data["expires_at"]
-        except KeyError as e:
-            raise RuntimeError(
-                f"Unexpected token response (missing {e}): {data}"
-            ) from e
+    try:
+        token = data["token"]
+        expires_str = data["expires_at"]
+    except KeyError as e:
+        raise RuntimeError(
+            f"Unexpected token response (missing {e}): {data}"
+        ) from e
 
-        # Use the actual expiry from GitHub's response.
-        expires_at = datetime.fromisoformat(
-            expires_str.replace("Z", "+00:00")
-        )
+    # Parse expiry and store under lock.
+    expires_at = datetime.fromisoformat(
+        expires_str.replace("Z", "+00:00")
+    )
+    with _token_lock:
+        _token_cache.token = token
         _token_cache.expires_at = expires_at.timestamp()
-        log.info("Refreshed GitHub App installation token")
-        return _token_cache.token
+    log.info("Refreshed GitHub App installation token")
+    return token
 
 
 def _gh_env() -> dict[str, str]:
