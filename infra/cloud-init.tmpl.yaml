@@ -90,7 +90,7 @@ runcmd:
   # "nodistro" is NodeSource's intentional suite name (not a distro codename like jammy).
   - echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
   - apt-get update && apt-get install -y nodejs
-  - npm install -g @anthropic-ai/claude-code@latest
+  - npm install -g @anthropic-ai/claude-code@2
   - echo "Installed claude-code version:" && npm list -g @anthropic-ai/claude-code --depth=0
 
   # ── Install GitHub CLI ────────────────────────────────────
