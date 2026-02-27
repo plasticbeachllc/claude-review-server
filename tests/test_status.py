@@ -48,8 +48,8 @@ class TestStatusHealthCheck:
     @patch("status.ssh")
     @patch("status.Client")
     @patch("status.load_config")
-    def test_healthy_json_is_recognized(self, mock_config, MockClient, mock_ssh, mock_requests_get):
-        """Regression: status.py previously compared against 'ok' instead of JSON."""
+    def test_old_ok_response_is_unhealthy(self, mock_config, MockClient, mock_ssh, mock_requests_get):
+        """Regression: the old 'ok' response should NOT be treated as healthy."""
         from status import main
 
         mock_config.return_value = {
@@ -62,22 +62,25 @@ class TestStatusHealthCheck:
 
         mock_ssh.side_effect = [
             "active",
-            '{"status":"healthy"}',
+            "ok",  # old-style response that should fail the JSON parse
         ]
         mock_requests_get.return_value = MagicMock(status_code=200)
 
-        # Should NOT exit with code 2 (unhealthy)
-        main()  # implicitly exit 0 = healthy
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
 
+    @patch("status.requests.get")
     @patch("status.ssh")
     @patch("status.Client")
     @patch("status.load_config")
-    def test_unhealthy_service_exits_two(self, mock_config, MockClient, mock_ssh):
+    def test_unhealthy_service_exits_two(self, mock_config, MockClient, mock_ssh, mock_requests_get):
         from status import main
 
         mock_config.return_value = {
             "SERVER_NAME": "pr-review",
             "HCLOUD_TOKEN": "tok",
+            "TUNNEL_HOSTNAME": "review.example.com",
         }
         mock_client = MockClient.return_value
         mock_client.servers.get_by_name.return_value = self._make_server()
@@ -86,6 +89,7 @@ class TestStatusHealthCheck:
             "inactive",                       # systemctl is-active
             '{"status":"healthy"}',           # curl health
         ]
+        mock_requests_get.return_value = MagicMock(status_code=200)
 
         with pytest.raises(SystemExit) as exc:
             main()
@@ -123,15 +127,17 @@ class TestStatusHealthCheck:
             main()
         assert exc.value.code == 1
 
+    @patch("status.requests.get")
     @patch("status.ssh")
     @patch("status.Client")
     @patch("status.load_config")
-    def test_unreachable_health_exits_two(self, mock_config, MockClient, mock_ssh):
+    def test_unreachable_health_exits_two(self, mock_config, MockClient, mock_ssh, mock_requests_get):
         from status import main
 
         mock_config.return_value = {
             "SERVER_NAME": "pr-review",
             "HCLOUD_TOKEN": "tok",
+            "TUNNEL_HOSTNAME": "review.example.com",
         }
         mock_client = MockClient.return_value
         mock_client.servers.get_by_name.return_value = self._make_server()
@@ -140,6 +146,7 @@ class TestStatusHealthCheck:
             "active",
             "unreachable",  # curl failed
         ]
+        mock_requests_get.return_value = MagicMock(status_code=200)
 
         with pytest.raises(SystemExit) as exc:
             main()

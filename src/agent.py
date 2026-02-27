@@ -367,8 +367,14 @@ def collapse_old_reviews(repo: str, pr_number: int):
 
     for line in result.stdout.strip().splitlines():
         try:
-            # @json double-encodes: outer string wrapping inner JSON object
-            comment = json.loads(json.loads(line))
+            # @json double-encodes: the outer json.loads unwraps the string
+            # envelope, the inner one parses the actual object.  We use @json
+            # (rather than jq -c) because -c still emits literal newlines
+            # inside string values, breaking line-based iteration.
+            inner = json.loads(line)
+            comment = json.loads(inner) if isinstance(inner, str) else inner
+            if not isinstance(comment, dict):
+                continue
             comment_id = comment.get("id")
             old_body = comment.get("body")
         except (json.JSONDecodeError, AttributeError, TypeError):
