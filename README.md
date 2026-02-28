@@ -171,15 +171,7 @@ This opens your browser twice — click **Create GitHub App**, then **Install** 
 
 When it finishes, `GH_APP_ID`, `GH_INSTALLATION_ID`, `GITHUB_WEBHOOK_SECRET` are filled in your `.env` and a `github-app.pem` file appears in the project root. Don't edit these values manually.
 
-### Step 3: Run tests
-
-```bash
-just test
-```
-
-All tests should pass. If any fail, check your `.env` values — the tests validate configuration, webhook signature logic, and diff truncation.
-
-### Step 4: Provision the server
+### Step 3: Provision the server
 
 ```bash
 just provision
@@ -201,7 +193,7 @@ When it finishes, you'll see:
 ══════════════════════════════════════════════════════════════
 ```
 
-### Step 5: Verify it works
+### Step 4: Verify it works
 
 ```bash
 just status
