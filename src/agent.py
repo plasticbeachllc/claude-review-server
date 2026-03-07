@@ -553,6 +553,8 @@ def review_pr(
     """
     log.info(f"Reviewing {pr_key}: {pr_title} ({action}) [gen={generation}]")
     try:
+        # Only skip for "opened" to avoid double-reviewing if the webhook
+        # fires twice.  ready_for_review should always trigger a fresh review.
         if action == "opened" and already_reviewed(repo, pr_number):
             log.info(f"Already reviewed {pr_key}, skipping")
             return
