@@ -554,7 +554,10 @@ def review_pr(
     log.info(f"Reviewing {pr_key}: {pr_title} ({action}) [gen={generation}]")
     try:
         # Only skip for "opened" to avoid double-reviewing if the webhook
-        # fires twice.  ready_for_review should always trigger a fresh review.
+        # fires twice.  ready_for_review intentionally bypasses this so a
+        # fresh review always runs when a draft goes ready.  This means a
+        # GitHub webhook retry could produce a duplicate review, but that's
+        # rare and acceptable vs. silently skipping a legitimate transition.
         if action == "opened" and already_reviewed(repo, pr_number):
             log.info(f"Already reviewed {pr_key}, skipping")
             return

@@ -1013,6 +1013,26 @@ class TestReviewPr:
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_ready_for_review_reviews_even_if_already_reviewed(self, mock_template, mock_run, mock_popen):
+        mock_run.side_effect = [
+            # gh pr diff (no already_reviewed check for ready_for_review)
+            _subprocess_result(stdout="diff --git a/f.py b/f.py\n+change\n"),
+            # gh pr view --json body,headRefOid
+            _subprocess_result(stdout='{"body":"Ready now"}\n'),
+            # gh pr comment
+            _subprocess_result(stdout="https://github.com/owner/repo/pull/1#comment"),
+        ]
+        mock_popen.return_value = self._mock_claude("Looks good.")
+
+        self._call_review("owner/repo", 1, "Fix bug", "ready_for_review")
+
+        # Should proceed to full review (no already_reviewed call)
+        mock_popen.assert_called_once()
+        assert mock_run.call_count == 3
+
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
     def test_synchronize_collapses_old_reviews(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             # collapse_old_reviews: gh api list comments (no uncollapsed)
@@ -1374,8 +1394,9 @@ class TestWebhookHandlerPost:
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
         mock_schedule.assert_called_once()
-        assert mock_schedule.call_args[0][1] == 0  # no debounce delay
-        assert mock_schedule.call_args[0][5] == "ready_for_review"  # action
+        args = mock_schedule.call_args.args
+        assert args[1] == 0, "expected zero debounce delay for ready_for_review"
+        assert args[5] == "ready_for_review", "expected action forwarded correctly"
 
     @patch("agent._schedule_review")
     def test_ready_for_review_draft_still_skipped(self, mock_schedule, http_server):
