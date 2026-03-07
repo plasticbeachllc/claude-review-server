@@ -1393,6 +1393,7 @@ class TestWebhookHandlerPost:
         }
         status, _ = self._post(http_server, "/webhook", payload, headers)
         assert status == 200
+        self._wait_for_call(mock_schedule)
         mock_schedule.assert_called_once()
         args = mock_schedule.call_args.args
         assert args[1] == 0, "expected zero debounce delay for ready_for_review"
