@@ -554,10 +554,8 @@ def review_pr(
     log.info(f"Reviewing {pr_key}: {pr_title} ({action}) [gen={generation}]")
     try:
         # Only skip for "opened" to avoid double-reviewing if the webhook
-        # fires twice.  ready_for_review intentionally bypasses this so a
-        # fresh review always runs when a draft goes ready.  This means a
-        # GitHub webhook retry could produce a duplicate review, but that's
-        # rare and acceptable vs. silently skipping a legitimate transition.
+        # fires twice.  ready_for_review always gets a fresh review (the
+        # previous one from "opened" is collapsed below).
         if action == "opened" and already_reviewed(repo, pr_number):
             log.info(f"Already reviewed {pr_key}, skipping")
             return
@@ -567,8 +565,8 @@ def review_pr(
             log.info(f"Superseded before start {pr_key} gen={generation}")
             return
 
-        # Collapse old reviews on force-push
-        if action == "synchronize":
+        # Collapse old reviews on force-push or draft→ready transition
+        if action in ("synchronize", "ready_for_review"):
             collapse_old_reviews(repo, pr_number)
 
         diff_result = subprocess.run(

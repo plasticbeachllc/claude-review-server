@@ -1010,15 +1010,18 @@ class TestReviewPr:
         # Only already_reviewed call, nothing else
         assert mock_run.call_count == 1
 
+    @patch("agent.already_reviewed", return_value=True)
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
-    def test_ready_for_review_reviews_even_if_already_reviewed(self, mock_template, mock_run, mock_popen):
+    def test_ready_for_review_skips_already_reviewed_check(self, mock_template, mock_run, mock_popen, mock_ar):
         mock_run.side_effect = [
-            # gh pr diff (no already_reviewed check for ready_for_review)
+            # collapse_old_reviews: gh api list comments (no uncollapsed)
+            _subprocess_result(stdout=""),
+            # gh pr diff
             _subprocess_result(stdout="diff --git a/f.py b/f.py\n+change\n"),
             # gh pr view --json body,headRefOid
-            _subprocess_result(stdout='{"body":"Ready now"}\n'),
+            _subprocess_result(stdout='{"body":"Ready now","headRefOid":"a"}\n'),
             # gh pr comment
             _subprocess_result(stdout="https://github.com/owner/repo/pull/1#comment"),
         ]
@@ -1026,9 +1029,10 @@ class TestReviewPr:
 
         self._call_review("owner/repo", 1, "Fix bug", "ready_for_review")
 
-        # Should proceed to full review (no already_reviewed call)
+        # already_reviewed is never consulted for ready_for_review
+        mock_ar.assert_not_called()
+        # But the review still proceeds
         mock_popen.assert_called_once()
-        assert mock_run.call_count == 3
 
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
@@ -1401,6 +1405,8 @@ class TestWebhookHandlerPost:
 
     @patch("agent._schedule_review")
     def test_ready_for_review_draft_still_skipped(self, mock_schedule, http_server):
+        # GitHub guarantees draft=false in ready_for_review payloads, but
+        # we test the guard defensively in case of malformed webhooks.
         payload = _make_pr_payload(action="ready_for_review", draft=True)
         sig = _sign_payload(payload)
         headers = {
