@@ -1363,6 +1363,21 @@ class TestWebhookHandlerPost:
         mock_schedule.assert_not_called()
 
     @patch("agent._schedule_review")
+    def test_ready_for_review_triggers_review(self, mock_schedule, http_server):
+        payload = _make_pr_payload(action="ready_for_review", draft=False)
+        sig = _sign_payload(payload)
+        headers = {
+            "Content-Length": str(len(payload)),
+            "X-Hub-Signature-256": sig,
+            "X-GitHub-Event": "pull_request",
+        }
+        status, _ = self._post(http_server, "/webhook", payload, headers)
+        assert status == 200
+        mock_schedule.assert_called_once()
+        call_args = mock_schedule.call_args
+        assert call_args[0][1] == 0  # no debounce delay
+
+    @patch("agent._schedule_review")
     def test_non_pr_event_ignored(self, mock_schedule, http_server):
         payload = _make_pr_payload()
         sig = _sign_payload(payload)

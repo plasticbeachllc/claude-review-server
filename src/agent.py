@@ -796,7 +796,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         try:
             data = json.loads(payload)
             action = data.get("action")
-            if action not in ("opened", "synchronize"):
+            if action not in ("opened", "synchronize", "ready_for_review"):
                 return
 
             pr = data["pull_request"]
@@ -809,7 +809,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             pr_key = f"{repo}#{pr_number}"
             generation = _bump_generation(pr_key)
 
-            delay = 0 if action == "opened" else DEBOUNCE_SECONDS
+            delay = 0 if action in ("opened", "ready_for_review") else DEBOUNCE_SECONDS
             _schedule_review(
                 pr_key, delay,
                 repo, pr_number, pr["title"], action, generation,
