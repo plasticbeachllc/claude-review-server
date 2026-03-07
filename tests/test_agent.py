@@ -1010,6 +1010,30 @@ class TestReviewPr:
         # Only already_reviewed call, nothing else
         assert mock_run.call_count == 1
 
+    @patch("agent.already_reviewed", return_value=True)
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_ready_for_review_skips_already_reviewed_check(self, mock_template, mock_run, mock_popen, mock_ar):
+        mock_run.side_effect = [
+            # collapse_old_reviews: gh api list comments (no uncollapsed)
+            _subprocess_result(stdout=""),
+            # gh pr diff
+            _subprocess_result(stdout="diff --git a/f.py b/f.py\n+change\n"),
+            # gh pr view --json body,headRefOid
+            _subprocess_result(stdout='{"body":"Ready now","headRefOid":"a"}\n'),
+            # gh pr comment
+            _subprocess_result(stdout="https://github.com/owner/repo/pull/1#comment"),
+        ]
+        mock_popen.return_value = self._mock_claude("Looks good.")
+
+        self._call_review("owner/repo", 1, "Fix bug", "ready_for_review")
+
+        # already_reviewed is never consulted for ready_for_review
+        mock_ar.assert_not_called()
+        # But the review still proceeds
+        mock_popen.assert_called_once()
+
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
@@ -1352,6 +1376,38 @@ class TestWebhookHandlerPost:
     @patch("agent._schedule_review")
     def test_draft_pr_skipped(self, mock_schedule, http_server):
         payload = _make_pr_payload(action="opened", draft=True)
+        sig = _sign_payload(payload)
+        headers = {
+            "Content-Length": str(len(payload)),
+            "X-Hub-Signature-256": sig,
+            "X-GitHub-Event": "pull_request",
+        }
+        status, _ = self._post(http_server, "/webhook", payload, headers)
+        assert status == 200
+        mock_schedule.assert_not_called()
+
+    @patch("agent._schedule_review")
+    def test_ready_for_review_triggers_review(self, mock_schedule, http_server):
+        payload = _make_pr_payload(action="ready_for_review", draft=False)
+        sig = _sign_payload(payload)
+        headers = {
+            "Content-Length": str(len(payload)),
+            "X-Hub-Signature-256": sig,
+            "X-GitHub-Event": "pull_request",
+        }
+        status, _ = self._post(http_server, "/webhook", payload, headers)
+        assert status == 200
+        self._wait_for_call(mock_schedule)
+        mock_schedule.assert_called_once()
+        args = mock_schedule.call_args.args
+        assert args[1] == 0, "expected zero debounce delay for ready_for_review"
+        assert args[5] == "ready_for_review", "expected action forwarded correctly"
+
+    @patch("agent._schedule_review")
+    def test_ready_for_review_draft_still_skipped(self, mock_schedule, http_server):
+        # GitHub guarantees draft=false in ready_for_review payloads, but
+        # we test the guard defensively in case of malformed webhooks.
+        payload = _make_pr_payload(action="ready_for_review", draft=True)
         sig = _sign_payload(payload)
         headers = {
             "Content-Length": str(len(payload)),

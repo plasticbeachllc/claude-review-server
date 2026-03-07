@@ -553,6 +553,9 @@ def review_pr(
     """
     log.info(f"Reviewing {pr_key}: {pr_title} ({action}) [gen={generation}]")
     try:
+        # Only skip for "opened" to avoid double-reviewing if the webhook
+        # fires twice.  ready_for_review always gets a fresh review (the
+        # previous one from "opened" is collapsed below).
         if action == "opened" and already_reviewed(repo, pr_number):
             log.info(f"Already reviewed {pr_key}, skipping")
             return
@@ -562,8 +565,8 @@ def review_pr(
             log.info(f"Superseded before start {pr_key} gen={generation}")
             return
 
-        # Collapse old reviews on force-push
-        if action == "synchronize":
+        # Collapse old reviews on force-push or draft→ready transition
+        if action in ("synchronize", "ready_for_review"):
             collapse_old_reviews(repo, pr_number)
 
         diff_result = subprocess.run(
@@ -796,7 +799,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         try:
             data = json.loads(payload)
             action = data.get("action")
-            if action not in ("opened", "synchronize"):
+            if action not in ("opened", "synchronize", "ready_for_review"):
                 return
 
             pr = data["pull_request"]
@@ -809,7 +812,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             pr_key = f"{repo}#{pr_number}"
             generation = _bump_generation(pr_key)
 
-            delay = 0 if action == "opened" else DEBOUNCE_SECONDS
+            delay = 0 if action in ("opened", "ready_for_review") else DEBOUNCE_SECONDS
             _schedule_review(
                 pr_key, delay,
                 repo, pr_number, pr["title"], action, generation,
